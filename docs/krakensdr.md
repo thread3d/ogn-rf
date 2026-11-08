@@ -6,10 +6,107 @@ bring-up log live in the companion repository
 [`thread3d/KrakenSDR`](https://github.com/thread3d/KrakenSDR); this file is the part that belongs
 next to the code.
 
-**Status: design only.** No source files have been modified yet. The branch exists so that
-modifications have somewhere to land and so the design can be reviewed before code is written.
+**Status: reception works on the KrakenSDR.** A single tuner at a fixed 868.300 MHz (the European
+OGN centre frequency) acquires real OGN time slots and writes valid 8-bit IQ. Verified on a Jetson
+Xavier AGX: 5,099,640 bytes captured in 10 s, full 0–255 range, mean 127.37 about the 128 centre,
+stddev 9.91 — a healthy Gaussian distribution, not zeros and not a stuck ADC.
 
-## Why this is not a one-line change
+Getting there required **one source change** — see "FFTW planning" below. Multi-channel and coherent
+direction-finding work is still design only.
+
+## Verified working configuration
+
+```
+RF = {
+  DeviceSerial = "1000";   # tuner by EEPROM serial, NOT by index
+  FreqPlan = 1;            # Europe/Africa -> fixed 868.200/868.400 MHz
+  FreqRaster = 1;
+  BiasTee = 0;
+  OfsTune = 0;
+  FreqCorr = 0;
+  SampleRate = 1000000;
+  OGN = { Gain = 400; GainMode = 0; SampleRate = 1000000;
+          SensTime = 0.85; StartTime = 0.375; };
+};
+Position = { Latitude = 51.5; Longitude = -0.1; };
+APRS = { Call = "TEST0"; };   # also becomes the raw-capture filename prefix
+```
+
+Build, using the dependencies that `thread3d/KrakenSDR`'s `scripts/build-deps.sh` produces:
+
+```bash
+P=~/projects/KrakenSDR/krakensdr/deps/prefix
+make FLAGS="-Wall -O3 -ffast-math -DVERSION=0.2.6 -I$P/include" \
+     LIBS="-L$P/lib -Wl,-rpath,$P/lib -lpthread -lm -ljpeg -lconfig -lrt" ogn-rf
+```
+
+Run it:
+
+```bash
+sleep infinity | ./ogn-rf /path/to/config.conf
+```
+
+The `sleep infinity |` is **not optional** — see "stdin" below.
+
+Startup, for reference:
+
+```
+RTLSDR::Open(1,868300000,1000000) => Generic RTL2832U OEM,  868.300 MHz, 1.000 Msps
+HTTP_Server.Exec() ... Listening on port 8080
+Inp_FFT.Exec() ... ogn-rf.fifo has been created
+RF_Acq.Exec() ... Half time slot
+```
+
+It opened **device index 1** for serial `1000` — exactly the enumeration-order trap described below.
+
+`Half time slot` and `Dropped a slot` are expected while nothing consumes the output FIFO:
+`OutQueue` fills because no decoder drains it. They go away once `ogn-decode` (or another consumer)
+is attached, and are not a bug in this branch.
+
+## Change 1 — FFTW planning flag (`fft.h`)
+
+The only source change needed to make ogn-rf usable on this hardware.
+
+`fft.h` hard-coded `FFTW_MEASURE`, which benchmarks candidate algorithms at plan time. On this host
+**single-precision** planning is pathologically slow while double-precision planning is instant:
+
+| transform | points | `FFTW_MEASURE` |
+|---|---|---|
+| float (`fftwf`) | 4 096 | **37.144 s** |
+| float (`fftwf`) | 32 768 | **60.858 s** |
+| double (`fftw`) | 4 096 | 0.022 s |
+| double (`fftw`) | 32 768 | 0.038 s |
+
+ogn-rf plans three float transforms **in global constructors, before `main()`** (`Inp_Filter` plans
+32 768 points, `Inp_FFT` 4 096, `GSM_FFT` likewise). With `FFTW_MEASURE` the process therefore burns
+one core at 100 % for over two minutes producing no output at all — no log line, no USB open, no
+acquisition thread — and is easily mistaken for a deadlock or crash.
+
+The patch replaces the hard-coded flag with an overridable macro defaulting to `FFTW_ESTIMATE`:
+
+```c
+#ifndef FFTW_PLAN_FLAG
+#define FFTW_PLAN_FLAG FFTW_ESTIMATE
+#endif
+```
+
+Both plan calls use `FFTW_PLAN_FLAG`, and `FFTW_MEASURE` stays available via
+`-DFFTW_PLAN_FLAG=FFTW_MEASURE` for hosts where measuring is cheap. The better long-term answer is
+FFTW **wisdom caching** (plan once, persist, reload) so optimal plans are kept without paying for
+them at every start; that is the recommended follow-up.
+
+## Two runtime traps that look like bugs
+
+**stdin.** `main()` runs `while(!RF.StopReq) { if(fgets(Cmd,128,stdin)==0) break; ... }`. If stdin is
+at EOF — from `nohup`, a script, `/dev/null`, or most service managers — it breaks immediately,
+sleeps 4 s, stops the acquisition thread and exits having done nothing. It needs a stdin that stays
+open: a pty, or `sleep infinity | ogn-rf ...`.
+
+**Output buffering.** When stdout is a pipe, `printf` is block-buffered, so killing the process with
+`timeout` discards everything it printed. Use `stdbuf -oL -eL` or redirect to a file, otherwise a
+perfectly working process looks completely silent.
+
+## Why the multi-channel work is not a one-line change
 
 `ogn-rf` talks to the radio through one class, `RTLSDR` in `rtlsdr.h`, which is a thin wrapper over
 `librtlsdr`. That works for one dongle. A KrakenSDR is not one dongle:
