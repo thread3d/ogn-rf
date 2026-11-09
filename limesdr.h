@@ -108,6 +108,7 @@ class LimeSDR
 
    uint32_t      Freq;              // [Hz] nominal (uncorrected) centre frequency
    int           FreqCorr;          // [ppm] software frequency correction
+   double        LastLO;            // [Hz] LO last programmed into the chip, so a repeat costs nothing
 
    int           GainMode;          // last requested gain mode: 0=Auto, >=1=Manual
    double        GaindB;            // [dB] gain actually applied
@@ -127,7 +128,7 @@ class LimeSDR
    LimeSDR()
    { DeviceIndex=0; DeviceSerial[0]=0; Device=0; Stream=0;
      Mtu=0; Scratch=0; Shift=8; ReadTimeoutUs=250000; MaxTimeouts=8;
-     Gains=0; FreqRaster=0; Freq=0; FreqCorr=0; Oversample=32; OversampleApplied=0;
+     Gains=0; FreqRaster=0; Freq=0; FreqCorr=0; LastLO=0; Oversample=32; OversampleApplied=0;
      GainMode=1; GaindB=0; BiasTee=(-1);
      Antenna=(-1); AntennaName[0][0]=0;
      BytesRead=0; SamplePeriod=1e-6; }
@@ -168,7 +169,7 @@ class LimeSDR
        try { SoapySDR::Device::unmake(Device); }   catch(const std::exception &Ex) {}
        Device=0; }
      if(Scratch) { free(Scratch); Scratch=0; }
-     Mtu=0; Gains=0; Antenna=(-1); DeviceSerial[0]=0; }
+     Mtu=0; Gains=0; Antenna=(-1); DeviceSerial[0]=0; LastLO=0; }
 
    int Open(uint32_t DeviceIndex=0, uint32_t Frequency=868000000, uint32_t SampleRate=1024000)
    { Close();
@@ -326,8 +327,18 @@ class LimeSDR
    { if(Device==0) return -1;
      double LO=(double)Freq;
      if(FreqCorr) LO*=1.0+1e-6*FreqCorr;                       // ppm correction, in software
+
+     // Retuning costs ~60 ms (PLL re-lock plus the LMS7002M's calibration) and SoapyLMS7 does not
+     // skip a retune that changes nothing, so an unchanged LO is worth catching here. It is the
+     // common case, not an edge case: the European OGN plan puts both of its channels 200 kHz
+     // apart inside one capture window, so ogn-rf drives a constant centre frequency for ever and
+     // would otherwise pay that 60 ms on every slot.
+     if( (LastLO!=0) && (fabs(LO-LastLO) < 0.5) ) return 1;
+
      try { Device->setFrequency(SOAPY_SDR_RX, Channel, LO); }
      catch(const std::exception &Ex) { printf("LimeSDR::setFrequency(%8.3f MHz) => %s\n", 1e-6*LO, Ex.what()); return -1; }
+
+     LastLO=LO;
      return 1; }
 
    // -----------------------------------------------------------------------------------------------
