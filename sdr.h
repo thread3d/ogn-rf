@@ -145,6 +145,36 @@ class SDR_Device
 #endif
    }
 
+   // LimeSDR only: reference clock selection. Ignored by an RTL-SDR, which has no such control.
+   void setClockSource(const char *Name)
+   {
+#ifdef USE_LIMESDR
+     if(Type==LIME_SDR)
+     { if(Name && Name[0]) { strncpy(Lms.ClockSource, Name, 16); Lms.ClockSource[15]=0; }
+       else Lms.ClockSource[0]=0; }
+#else
+     (void)Name;
+#endif
+   }
+
+   void setReferenceRate(double Hz)
+   {
+#ifdef USE_LIMESDR
+     if(Type==LIME_SDR) Lms.ReferenceRate = Hz>0 ? Hz : 0;
+#else
+     (void)Hz;
+#endif
+   }
+
+   // What the device reported after we asked, for the status page.
+   const char *getClockSourceApplied(void)
+   {
+#ifdef USE_LIMESDR
+     if(Type==LIME_SDR) return Lms.ClockSourceApplied;
+#endif
+     return "";
+   }
+
    // What the device actually accepted, for the status page: 0 means the driver chose.
    int getOversampleApplied(void)
    {
@@ -163,6 +193,8 @@ class SDR_Device
    int setTunerGain(int Gain)        { return (Type==LIME_SDR) ? Lms.setTunerGain(Gain)       : RTL.setTunerGain(Gain); }
    int getTunerGain(void)            { return (Type==LIME_SDR) ? Lms.getTunerGain()           : RTL.getTunerGain(); }
    int getTunerGains(int *Gain=0)    { return (Type==LIME_SDR) ? Lms.getTunerGains(Gain)      : RTL.getTunerGains(Gain); }
+   int setTunerGainManual(int Manual=1) { return setTunerGainMode(Manual); }
+   int setTunerGainAuto(void)           { return setTunerGainMode(0); }
 
    // -----------------------------------------------------------------------------------------------
    // RTL-SDR specific options, accepted (and ignored) for LimeSDR

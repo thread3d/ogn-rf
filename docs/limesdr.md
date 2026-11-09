@@ -59,6 +59,7 @@ RF = {
   FreqCorr     = 0;
   SampleRate   = 2000000;        // highest rate ogn-decode accepts
   Oversample   = 32;             // stepped down to 16 at 2 MSps; see below
+  ClockSource  = "internal";     // or "external" with ReferenceRate in Hz; needs SoapySDR 0.8+
   OGN = { Gain = 61.0; GainMode = 1; SampleRate = 2000000;
           SensTime = 0.85; StartTime = 0.375; };
 };
@@ -137,6 +138,25 @@ enabled, the CS16 words reach ±25472, so the 16-bit words carry the signal at 1
 `liblimesuite-dev` was not installed (only the shared library), while `libsoapysdr-dev` and the
 SoapyLMS7 module were. SoapySDR is also the interface the surrounding tooling already speaks, and
 it leaves a second radio (Airspy, bladeRF, …) behind the same `sdr.h` switch for free.
+
+## Reference clock
+
+`RF.ClockSource` ("internal"/"external") and `RF.ReferenceRate` (Hz) map to SoapyLMS7's
+`setClockSource()` / `setReferenceClockRate()`, applied before the rate and tuning. The second of
+those is a SoapySDR 0.8 virtual, so it is compiled out below that (`SOAPY_SDR_API_VERSION`), where the
+backend reports that it is ignoring the rate rather than failing to build. Both cases were verified.
+
+A warning worth carrying: with no reference attached, selecting `external` succeeds silently, leaves
+reception untouched, and `clock_locked` still reads `true`. The device is still on its VCTCXO. So the
+status page reports requested *and* device-reported source, and neither should be read as proof of
+discipline.
+
+`gsm_scan` now drives the LimeSDR with `--limesdr`, which is how the frequency error gets measured
+rather than assumed. On this board it reported the VCTCXO **+14.4 ppm fast, ±0.05 ppm**, about
++12.5 kHz at 868.300 MHz — outside the ±1 ppm initial spec, and presumably being pulled by the tuning
+DAC. That measurement also found a **sign bug** in `setFreqCorrection()`, which was adding the
+correction to the error instead of subtracting it (`LO × (1 + ppm·1e-6)`); it is now `1 − ppm·1e-6`.
+`RF.FreqCorr = 14` compensates the board in software in the meantime.
 
 ## What is not proven
 

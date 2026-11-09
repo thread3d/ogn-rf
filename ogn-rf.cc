@@ -86,6 +86,8 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
 
    int  DeviceType;                             // 0=RTL-SDR, 1=LimeSDR, see sdr.h
    int  Oversample;                             // [LimeSDR] on-chip decimation ratio, 0 = driver decides
+   char ClockSource[16];                        // [LimeSDR] "internal" / "external", empty = leave alone
+   double ReferenceRate;                        // [LimeSDR] external reference clock rate [Hz], 0 = leave alone
    int  DeviceIndex;                            // rtl-sdr device index
    char DeviceSerial[64];                       // serial number of the rtl-sdr device to be selected
    int  OffsetTuning;                           // [bool] this option might be good for E4000 tuner
@@ -150,6 +152,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     HoppingPlan.setPlan(0);
     PulseFilt.Threshold=0;
     DeviceType=SDR_Device::RTL_SDR; DeviceIndex=0; DeviceSerial[0]=0; Oversample=0;
+    ClockSource[0]=0; ReferenceRate=0;
     OffsetTuning=0; FreqCorr=0; FreqRaster=28125; BiasTee=(-1);
     // GSM_CenterFreq=GSM_LowEdge+GSM_ScanStep/2; GSM_Scan=1; GSM_SamplesPerRead=(250*SampleRate)/1000; GSM_Gain=200;
     GSM_CenterFreq=0; GSM_Scan=0; GSM_Gain=200;
@@ -172,6 +175,11 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     config_lookup_int(Config,   "RF.FreqRaster",     &FreqRaster);
     config_lookup_int(Config,   "RF.Device",         &DeviceIndex);
     config_lookup_int(Config,   "RF.Oversample",     &Oversample);   // LimeSDR: capture N x rate, decimate on chip
+    const char *ClockSrc = 0;                                         // LimeSDR: internal / external reference
+    if(config_lookup_string(Config,"RF.ClockSource", &ClockSrc)==CONFIG_TRUE && ClockSrc)
+    { strncpy(ClockSource, ClockSrc, 16); ClockSource[15]=0; }
+    double RefRate = 0;                                               // LimeSDR: external reference rate [Hz]
+    config_lookup_float_or_int(Config, "RF.ReferenceRate", &RefRate); ReferenceRate=RefRate;
     const char *DeviceTypeName = 0;                                     // RF.DeviceType = "rtlsdr" or "limesdr"
     if(config_lookup_string(Config,"RF.DeviceType", &DeviceTypeName)==CONFIG_TRUE)
       DeviceType=SDR_Device::getTypeByString(DeviceTypeName);
@@ -338,6 +346,8 @@ Content-Disposition: attachment; filename=\"%s_%07.3fMHz_%03.1fMsps_%10dsec.jpg\
        else                                                                // if not open yet or was closed due to an error
        { SDR.setType(DeviceType);                                          // RTL-SDR dongle or LimeSDR
          SDR.setOversample(Oversample);                                    // must precede Open()
+         SDR.setClockSource(ClockSource);                                  // must precede Open()
+         SDR.setReferenceRate(ReferenceRate);
          int Index=(-1);
          if(DeviceSerial[0]) Index=SDR.getDeviceIndexBySerial(DeviceSerial);
          if(Index<0) Index=DeviceIndex;
@@ -1018,8 +1028,15 @@ Refresh: 5\r\n\
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.FFTsize</td><td align=right><b>%d</b></td></tr>\n",                 FFT->Filter->FFTsize);
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.Threshold</td><td align=right><b>%3.1f</b></td></tr>\n",            FFT->Filter->Threshold);
      if(RF->SDR.HaveLimeSDR())
-       dprintf(Client->SocketFile, "<tr><td>RF.Oversample</td><td align=right><b>%d (auto) / applied %d</b></td></tr>\n",
+     { dprintf(Client->SocketFile, "<tr><td>RF.Oversample</td><td align=right><b>%d (auto) / applied %d</b></td></tr>\n",
                RF->Oversample, RF->SDR.getOversampleApplied());
+       if(RF->ClockSource[0] || RF->SDR.getClockSourceApplied()[0])
+         dprintf(Client->SocketFile, "<tr><td>RF.ClockSource</td><td align=right><b>%s / device says %s</b></td></tr>\n",
+                 RF->ClockSource[0]?RF->ClockSource:"(unset)",
+                 RF->SDR.getClockSourceApplied()[0]?RF->SDR.getClockSourceApplied():"(none)");
+       if(RF->ReferenceRate>0)
+         dprintf(Client->SocketFile, "<tr><td>RF.ReferenceRate</td><td align=right><b>%5.3f MHz</b></td></tr>\n",
+                 1e-6*RF->ReferenceRate); }
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.GainMode</td><td align=right><b>%d</b></td></tr>\n",                 RF->OGN_GainMode);
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.Gain</td><td align=right><b>%4.1f dB</b></td></tr>\n",           0.1*RF->OGN_Gain);
      // dprintf(Client->SocketFile, "<tr><td>RF.OGN.CenterFreq</td><td align=right><b>%5.1f MHz</b></td></tr>\n",   1e-6*RF->OGN_CenterFreq);

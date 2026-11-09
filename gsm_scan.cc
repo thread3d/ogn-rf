@@ -12,7 +12,7 @@
 #include <vector>
 #include <algorithm>
 
-#include "rtlsdr.h"
+#include "sdr.h"        // RTL-SDR or LimeSDR
 #include "buffer.h"
 #include "fft.h"
 #include "image.h"
@@ -122,17 +122,19 @@ const int GSM_DataRate     = 270833; // [bps]
   --gain <receiver gain>          [dB] receiver gain [default is auto-gain]\n\
   --offset-tuning                      enable offset tuning - for E4000 tuner\n\
   --gsm-850                            scan the GSM-850 band for USA and Canada (default is E-GSM for Europe)\n\
+  --limesdr                            use a LimeSDR instead of an RTL-SDR dongle\n\
 " ;
 
 int main(int argc, char **argv)
 { 
-  RTLSDR SDR;     // DVB-T device with the RTL2832U control chip
+  SDR_Device SDR; // DVB-T dongle or LimeSDR, chosen by --limesdr
 
   int RxDevice       =         0;    // [Index] device index for RTLSDR device
   int FreqRaster     =     28125;    // [Hz] 28800000>>10
   int RxCrystalCorr  =         0;    // [PPM] crystal frequency correction for the DVB-T receiver
   int RxGain         =       200;    // [0.1dB] receiver gain - low default gain for the GSM band as signals are strong
   int RxOffsetTuning =         0;    // [bool]
+  int UseLimeSDR     =         0;    // [bool] drive a LimeSDR rather than a dongle
   int SampleRate     =   2000000;    // [Hz] => single scan takes 10 GSM channels (0.2MHz/channel)
   int LowerFreq      = 920000000;    // [Hz] => scan whole E-GSM band
   int UpperFreq      = 960000000;    // [Hz]
@@ -168,6 +170,10 @@ int main(int argc, char **argv)
         if(sscanf(argv[++arg], "%f", &Gain)!=1)
         { printf("Not a valid number: %s for option %s\n", argv[arg], OptName); exit(0); }
         RxGain = (int)floor(10*Gain+0.5);
+        arg++; }
+      else if(strcmp(OptName,"limesdr")==0)
+      { UseLimeSDR=1;
+        if(FreqRaster==28125) FreqRaster=1;              // the 28.125 kHz raster is an RTL-SDR need
         arg++; }
       else if(strcmp(OptName,"offset-tuning")==0)
       { RxOffsetTuning=1;
@@ -210,9 +216,10 @@ int main(int argc, char **argv)
   printf("FFT: %d bins, %3.1fHz/bin, %5.3fms/slide\n",
           FFTsize, (double)SampleRate/FFTsize, 0.5e3*FFTsize/SampleRate);
 
-  if(SDR.Open(RxDevice, CenterFreq, SampleRate)<0)        // open the RTLSDR device
-  { printf("Can't open RTLSDR device #%d\n", RxDevice);  return 0; }
-  printf("Open(%d, %d, %d) OK\n", RxDevice, CenterFreq, SampleRate);
+  SDR.setType(UseLimeSDR ? SDR_Device::LIME_SDR : SDR_Device::RTL_SDR);
+  if(SDR.Open(RxDevice, CenterFreq, SampleRate)<0)        // open the radio
+  { printf("Can't open %s device #%d\n", SDR.getTypeName(SDR.getType()), RxDevice);  return 0; }
+  printf("Open(%d, %d, %d) OK on a %s\n", RxDevice, CenterFreq, SampleRate, SDR.getTypeName(SDR.getType()));
 
   SDR.setFreqCorrection(RxCrystalCorr);          // [PPM] correct the crystal frequencies
   printf("Tuner crystal correction set to %d ppm\n", RxCrystalCorr);
@@ -221,7 +228,8 @@ int main(int argc, char **argv)
   else
   { SDR.setTunerGainAuto(); printf("Tuner gain set to automatic\n"); }  // automatic gain control
 
-  SDR.setOffsetTuning(RxOffsetTuning); if(RxOffsetTuning) printf("Offset tuning activated\n");
+  SDR.setOffsetTuning(RxOffsetTuning);
+  if(RxOffsetTuning) printf("Offset tuning %s\n", UseLimeSDR ? "not applicable on a LimeSDR (ignored)" : "activated");
   SDR.FreqRaster=FreqRaster;
 
   printf("\n");

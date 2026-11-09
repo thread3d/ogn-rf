@@ -66,6 +66,7 @@
 #include <SoapySDR/Device.hpp>
 #include <SoapySDR/Formats.hpp>
 #include <SoapySDR/Errors.hpp>
+#include <SoapySDR/Version.h>   // SOAPY_SDR_API_VERSION, to compile out the 0.8-only reference-rate API
 
 #include "asciitime.h"
 #include "thread.h"
@@ -102,6 +103,10 @@ class LimeSDR
 
    uint32_t      FreqRaster;        // [Hz] use only multiples of this base value to avoid tuning errors
 
+   char          ClockSource[16];   // "internal" | "external" | "" = leave the driver alone
+   double        ReferenceRate;     // [Hz] external reference rate, 0 = leave the driver alone
+   char          ClockSourceApplied[16]; // what the device reports after we asked
+
    int           Oversample;        // requested ADC-to-host rate ratio: 0 = driver decides,
                                     // N = capture N x rate and decimate by N inside the LMS7002M
    int           OversampleApplied; // what the device actually accepted (0 = driver decided)
@@ -129,6 +134,7 @@ class LimeSDR
    { DeviceIndex=0; DeviceSerial[0]=0; Device=0; Stream=0;
      Mtu=0; Scratch=0; Shift=8; ReadTimeoutUs=250000; MaxTimeouts=8;
      Gains=0; FreqRaster=0; Freq=0; FreqCorr=0; LastLO=0; Oversample=32; OversampleApplied=0;
+     ClockSource[0]=0; ReferenceRate=0; ClockSourceApplied[0]=0;
      GainMode=1; GaindB=0; BiasTee=(-1);
      Antenna=(-1); AntennaName[0][0]=0;
      BytesRead=0; SamplePeriod=1e-6; }
@@ -196,6 +202,10 @@ class LimeSDR
 
      try
      {
+       // Reference clock selection first: it decides what the PLLs lock to, so it has to be in
+       // place before the rate and the tuning below.
+       ApplyReferenceClock();
+
        // Sample rate configuration, with the on-chip capture/decimate ratio applied first.
        //
        // Oversampling decides how the LMS7002M reaches the host rate: with a ratio of N the
@@ -326,7 +336,13 @@ class LimeSDR
    int ApplyFrequency(void)
    { if(Device==0) return -1;
      double LO=(double)Freq;
-     if(FreqCorr) LO*=1.0+1e-6*FreqCorr;                       // ppm correction, in software
+
+     // ppm correction, applied in software. The sign follows librtlsdr: the value is the error OF
+     // THE CRYSTAL, so a positive figure means the reference runs fast and the LO is programmed
+     // correspondingly low. Getting this backwards silently doubles the error instead of removing
+     // it - measured with gsm_scan, which is how the bug was found: applying +30 ppm to a receiver
+     // reading +14.4 ppm produced +44.1, i.e. a sum rather than a difference.
+     if(FreqCorr) LO*=1.0-1e-6*FreqCorr;
 
      // Retuning costs ~60 ms (PLL re-lock plus the LMS7002M's calibration) and SoapyLMS7 does not
      // skip a retune that changes nothing, so an unchanged LO is worth catching here. It is the
@@ -340,6 +356,55 @@ class LimeSDR
 
      LastLO=LO;
      return 1; }
+
+   // -----------------------------------------------------------------------------------------------
+   // Reference clock
+   // -----------------------------------------------------------------------------------------------
+
+   // Ask the device for a clock source and/or an external reference rate.
+   //
+   // SoapySDR gained setClockSource() in 0.7, but get/setReferenceClockRate() only in 0.8, so the
+   // rate half is compiled out on older stacks rather than failing to build.
+   //
+   // A warning about what this CANNOT tell you: on this board, selecting an external reference
+   // with nothing attached is accepted silently - the open succeeds, reception is unaffected and
+   // the clock_locked sensor still reports true, because the chip simply stays on its own VCTCXO.
+   // So a device reporting "external" is not evidence that it is disciplined. The only proof is
+   // measuring the absolute frequency error, which is what gsm_scan is for.
+   int ApplyReferenceClock(void)
+   { if(Device==0) return -1;
+     ClockSourceApplied[0]=0;
+
+     if(ClockSource[0])
+     { try
+       { Device->setClockSource(ClockSource);
+         std::string Got=Device->getClockSource();
+         strncpy(ClockSourceApplied, Got.c_str(), 16); ClockSourceApplied[15]=0;
+         printf("LimeSDR::Open() => clock source '%s' requested, device reports '%s'\n",
+                ClockSource, ClockSourceApplied);
+         if(strcmp(ClockSourceApplied, ClockSource)!=0)
+           printf("LimeSDR::Open() => WARNING clock source did not take\n"); }
+       catch(const std::exception &Ex)
+       { printf("LimeSDR::Open() => clock source '%s' rejected: %s\n", ClockSource, Ex.what()); } }
+
+     if(ReferenceRate>0)
+     {
+#if defined(SOAPY_SDR_API_VERSION) && (SOAPY_SDR_API_VERSION >= 0x00080000)
+       try
+       { Device->setReferenceClockRate(ReferenceRate);
+         printf("LimeSDR::Open() => external reference %.3f MHz requested, device reads %.3f MHz\n",
+                1e-6*ReferenceRate, 1e-6*Device->getReferenceClockRate());
+         printf("LimeSDR::Open() => NOTE an accepted reference is not a verified one: with no signal\n"
+                "                   on the input the chip stays on its VCTCXO and still reports a lock.\n"); }
+       catch(const std::exception &Ex)
+       { printf("LimeSDR::Open() => reference rate %.0f Hz rejected: %s\n", ReferenceRate, Ex.what()); }
+#else
+       printf("LimeSDR::Open() => RF.ReferenceRate ignored: SoapySDR %s has no reference-clock API\n",
+              SOAPY_SDR_ABI_VERSION);
+       printf("                   (needs SoapySDR 0.8+; RF.ClockSource alone is still applied)\n");
+#endif
+     }
+     return 0; }
 
    // -----------------------------------------------------------------------------------------------
    // Sample rate
@@ -382,6 +447,10 @@ class LimeSDR
      return (int)floor(10.0*GaindB+0.5); }
 
    int getTunerGain(void) const { return (int)floor(10.0*GaindB+0.5); }
+
+   // Same shortcuts RTLSDR offers, so gsm_scan can drive either radio unchanged
+   int setTunerGainManual(int Manual=1) { return setTunerGainMode(Manual); }
+   int setTunerGainAuto(void)           { return setTunerGainMode(0); }
 
    // Build a table of the gains this device can actually do, in the 0.1 dB units ogn-rf uses
    int BuildGainTable(void)
@@ -431,6 +500,12 @@ class LimeSDR
      catch(const std::exception &Ex) { return -1; }
      if(List.empty()) return -1;
 
+     // The LNA paths are band-limited (LNAL 0.7-0.9 GHz, LNAW 0.7-2.6 GHz, LNAH 2-2.6 GHz), and
+     // each maps to a different SMA connector: LNAL -> RX1_L, LNAW -> RX1_W. Choosing strictly by
+     // band would put 0.9-2.6 GHz on RX1_W, which is right for the chip but wrong for a board with
+     // its only antenna on RX1_L - and it fails silently, because an unconnected port still shows
+     // the receiver's own noise floor. So LNAL is preferred up to 1.5 GHz, where it is still usable,
+     // and moving beyond that needs an antenna on RX1_W or RX1_H. See docs for the trade-off.
      const char *Prefer[3] = { "LNAL", "LNAW", "LNAH" };       // low band first
      if(Frequency>=1500e6) { Prefer[0]="LNAH"; Prefer[1]="LNAW"; Prefer[2]="LNAL"; }
 
