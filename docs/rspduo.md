@@ -129,8 +129,27 @@ The device decimates on chip, and it matters more than it sounds: **the ADC cann
 hardware at 1 MHz and 500 kHz. So decimation is not an optimisation here, it is the *only* way to
 reach any rate below 2 MHz.
 
-`decimationFactor` accepts powers of two up to 32, measured by comparing the delivered rate against
-the ADC rate:
+**The highest decimation is 32, and only powers of two do anything.** That second half is the trap:
+the API accepts a factor of 3, 6, 7 or 12 without complaint and then delivers the full 2 MHz
+anyway — no error, no warning, no decimation. Measured by comparing the delivered rate against the
+ADC rate:
+
+| Factor | Expected | Delivered | Verdict |
+|---|---|---|---|
+| 2 | 1.0000 | 1.026 | applied |
+| 4 | 0.5000 | 0.508 | applied |
+| **6** | 0.3333 | **2.077** | **silently ignored** |
+| **7** | 0.2857 | **3.311** | **silently ignored** |
+| 8 | 0.2500 | 0.258 | applied |
+| 16 | 0.1250 | 0.129 | applied |
+| 32 | 0.0625 | 0.063 | applied |
+| 33 | — | — | `Init()` **fails** |
+
+So the validity check is on range, not on form: anything up to 32 is accepted, only powers of two
+take effect, and 33 and above is rejected outright. `SnapSampleRate()` only ever produces powers of
+two, so the backend cannot fall into the silent case — but anything driving the API directly can.
+
+The full picture, measured by comparing the delivered rate against the ADC rate:
 
 | Factor | Delivered from a 2 MHz ADC | Measured |
 |---|---|---|
