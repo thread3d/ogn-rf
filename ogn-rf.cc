@@ -32,7 +32,7 @@
 
 #include "thread.h"     // multi-thread stuff
 #include "fft.h"        // Fast Fourier Transform
-#include "rtlsdr.h"     // SDR radio
+#include "sdr.h"        // SDR radio: RTL-SDR or LimeSDR, chosen by RF.DeviceType
 
 #define QUOTE(name) #name
 #define STR(macro) QUOTE(macro)
@@ -84,13 +84,14 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
                                                 // the goal is to listen on center frequency from 0.4 to 1.2 sec
    FreqPlan         HoppingPlan;                // frequency hopping plan (depends on the world region)
 
+   int  DeviceType;                             // 0=RTL-SDR, 1=LimeSDR, see sdr.h
    int  DeviceIndex;                            // rtl-sdr device index
    char DeviceSerial[64];                       // serial number of the rtl-sdr device to be selected
    int  OffsetTuning;                           // [bool] this option might be good for E4000 tuner
    int  BiasTee;                                // [bool] T-bias for external LNA power
    int  FreqCorr;                               // [ppm] frequency correction applied to the Rx chip
    int  FreqRaster;                             // [Hz] use only center frequencies on this raster to avoid tuning inaccuracies
-   RTLSDR SDR;                                  // SDR receiver (DVB-T stick)
+   SDR_Device SDR;                              // SDR receiver: RTL-SDR dongle or LimeSDR
    ReuseObjectQueue< SampleBuffer<uint8_t> > OutQueue; // OGN sample batches are sent there
 
    Thread Thr;                                  // acquisition thread
@@ -147,7 +148,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     OGN_GainMode=1; OGN_Gain=600;
     HoppingPlan.setPlan(0);
     PulseFilt.Threshold=0;
-    DeviceIndex=0; DeviceSerial[0]=0;
+    DeviceType=SDR_Device::RTL_SDR; DeviceIndex=0; DeviceSerial[0]=0;
     OffsetTuning=0; FreqCorr=0; FreqRaster=28125; BiasTee=(-1);
     // GSM_CenterFreq=GSM_LowEdge+GSM_ScanStep/2; GSM_Scan=1; GSM_SamplesPerRead=(250*SampleRate)/1000; GSM_Gain=200;
     GSM_CenterFreq=0; GSM_Scan=0; GSM_Gain=200;
@@ -169,6 +170,11 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     config_lookup_float_or_int(Config,   "RF.FreqCorr", &Corr); FreqCorr = (int)floor(Corr+0.5);
     config_lookup_int(Config,   "RF.FreqRaster",     &FreqRaster);
     config_lookup_int(Config,   "RF.Device",         &DeviceIndex);
+    const char *DeviceTypeName = 0;                                     // RF.DeviceType = "rtlsdr" or "limesdr"
+    if(config_lookup_string(Config,"RF.DeviceType", &DeviceTypeName)==CONFIG_TRUE)
+      DeviceType=SDR_Device::getTypeByString(DeviceTypeName);
+    else if(config_lookup_string(Config,"RF.SDR", &DeviceTypeName)==CONFIG_TRUE)   // accepted alias
+      DeviceType=SDR_Device::getTypeByString(DeviceTypeName);
     const char *Serial = 0;
     config_lookup_string(Config,"RF.DeviceSerial",   &Serial);
     if(Serial) { strncpy(DeviceSerial, Serial, 64); DeviceSerial[63]=0; }
@@ -328,7 +334,8 @@ Content-Disposition: attachment; filename=\"%s_%07.3fMHz_%03.1fMsps_%10dsec.jpg\
          else usleep(100000);
        }
        else                                                                // if not open yet or was closed due to an error
-       { int Index=(-1);
+       { SDR.setType(DeviceType);                                          // RTL-SDR dongle or LimeSDR
+         int Index=(-1);
          if(DeviceSerial[0]) Index=SDR.getDeviceIndexBySerial(DeviceSerial);
          if(Index<0) Index=DeviceIndex;
          SDR.FreqRaster = FreqRaster;
@@ -955,7 +962,7 @@ Refresh: 5\r\n\
      }
 
      if(RF->SDR.isOpen())
-     { dprintf(Client->SocketFile, "<tr><th>RTL-SDR device #%d</th><th></th></tr>\n",                                  RF->SDR.DeviceIndex);
+     { dprintf(Client->SocketFile, "<tr><th>%s device #%d</th><th></th></tr>\n",                                    RF->SDR.getTypeName(RF->SDR.getType()), RF->SDR.DeviceIndex);
        dprintf(Client->SocketFile, "<tr><td>Name</td><td align=right><b>%s</b></td></tr>\n",                           RF->SDR.getDeviceName());
        dprintf(Client->SocketFile, "<tr><td>Tuner type</td><td align=right><b>%s</b></td></tr>\n",                     RF->SDR.getTunerTypeName());
        char Manuf[256], Product[256], Serial[256];
@@ -989,6 +996,7 @@ Refresh: 5\r\n\
 
      dprintf(Client->SocketFile, "<tr><th>RF</th><th></th></tr>\n");
      dprintf(Client->SocketFile, "<tr><td>RF.FreqPlan</td><td align=right><b>%d: %s</b></td></tr>\n",   RF->HoppingPlan.Plan, RF->HoppingPlan.getPlanName() );
+     dprintf(Client->SocketFile, "<tr><td>RF.DeviceType</td><td align=right><b>%s</b></td></tr>\n",                   RF->SDR.getTypeName(RF->DeviceType));
      dprintf(Client->SocketFile, "<tr><td>RF.Device</td><td align=right><b>%d</b></td></tr>\n",                       RF->DeviceIndex);
      if(RF->DeviceSerial[0])
        dprintf(Client->SocketFile, "<tr><td>RF.DeviceSerial</td><td align=right><b>%s</b></td></tr>\n",               RF->DeviceSerial);
