@@ -82,6 +82,12 @@ class LimeSDR
    SoapySDR::Stream *Stream;        // SoapySDR RX stream (0 when closed)
 
    enum { Channel = 0 };            // which RX channel to use: 0 is RX0 on a LimeSDR-USB
+
+   // The LMS7002M converter tops out at 61.44 MSps (2 x the 30.72 MHz reference). SoapyLMS7
+   // advertises a little more than that (0.1-65 MSps on this board) and rejects 80 MSps, but
+   // 61.44 is the figure the clocking is built around and the one an oversampling ratio has to
+   // respect.
+   static double ConverterMaxRate(void) { return 61440000.0; }
    std::string   HardwareKey;       // "LimeSDR-USB", cached: getHardwareKey() returns by value
    std::string   DeviceLabel;       // "LimeSDR-USB [USB 2.0] 9072...", cached for the same reason
 
@@ -204,16 +210,28 @@ class LimeSDR
        int    AppliedRatio = 0;
        bool   Configured = false;
 
-       if(Oversample>0)
+       // Step the requested ratio down to the largest power of two the converter can still run
+       // at, given the host rate. At 1 MSps that leaves 32; at 2 MSps it leaves 16, because
+       // 32 x 2 MSps would ask for a 64 MSps converter.
+       int Wanted=Oversample;
+       if(Wanted>0)
+       { int MaxRatio=(int)(ConverterMaxRate()/(double)SampleRate);
+         if(MaxRatio<1) MaxRatio=1;
+         while( (Wanted>1) && (Wanted>MaxRatio) ) Wanted>>=1;
+         if(Wanted!=Oversample)
+           printf("LimeSDR::Open() => oversampling %d x %d Hz exceeds the %.2f MSps converter, using %d\n",
+                  Oversample, SampleRate, 1e-6*ConverterMaxRate(), Wanted); }
+
+       if(Wanted>0)
        { try
-         { Device->writeSetting("OVERSAMPLING", std::to_string(Oversample));
+         { Device->writeSetting("OVERSAMPLING", std::to_string(Wanted));
            Device->setSampleRate(SOAPY_SDR_RX, Channel, (double)SampleRate);
            ActualRate=Device->getSampleRate(SOAPY_SDR_RX, Channel);
-           if(fabs(ActualRate-SampleRate)<=0.5) { AppliedRatio=Oversample; Configured=true; }
+           if(fabs(ActualRate-SampleRate)<=0.5) { AppliedRatio=Wanted; Configured=true; }
            else printf("LimeSDR::Open() => OVERSAMPLING=%d gave %8.1f Hz for %d Hz, retrying with auto\n",
-                       Oversample, ActualRate, SampleRate); }
+                       Wanted, ActualRate, SampleRate); }
          catch(const std::exception &Ex)
-         { printf("LimeSDR::Open() => OVERSAMPLING=%d rejected (%s), retrying with auto\n", Oversample, Ex.what()); } }
+         { printf("LimeSDR::Open() => OVERSAMPLING=%d rejected (%s), retrying with auto\n", Wanted, Ex.what()); } }
 
        if(!Configured)
        { try { Device->writeSetting("OVERSAMPLING", "0"); } catch(const std::exception &Ex) {}

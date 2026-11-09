@@ -57,9 +57,9 @@ RF = {
   BiasTee      = 0;
   OfsTune      = 0;
   FreqCorr     = 0;
-  SampleRate   = 1000000;
-  Oversample   = 32;             // on-chip capture/decimate ratio; 0 = driver decides
-  OGN = { Gain = 61.0; GainMode = 1; SampleRate = 1000000;
+  SampleRate   = 2000000;        // highest rate ogn-decode accepts
+  Oversample   = 32;             // stepped down to 16 at 2 MSps; see below
+  OGN = { Gain = 61.0; GainMode = 1; SampleRate = 2000000;
           SensTime = 0.85; StartTime = 0.375; };
 };
 Position = { Latitude = 51.5; Longitude = -0.1; };
@@ -98,12 +98,20 @@ discrete tuner gain table. `MTU=2040` is what SoapyLMS7 negotiates; a 0.85 s slo
 | bias tee | accepted and ignored — a LimeSDR-USB has none |
 | offset tuning | accepted and ignored — an RTL-SDR/E4000 concept |
 
+`RF.SampleRate` is 2 MSps because that is the highest rate `ogn-decode` accepts, and because the
+USB 2.0 link sustains about 4.1 MSps — half the available headroom. The LMS7002M converter itself
+could run at 61.44 MSps (2 × the 30.72 MHz reference; SoapyLMS7 advertises up to 65 MSps and rejects
+80), but on this link a request for 61.44 MSps yields only 4.07 MSps, so the link is the real
+ceiling. Running at 2 MSps buys demodulator margin, not sensitivity: the two channels occupy about
+250 kHz around the 868.300 MHz centre, which 1 MHz already covered.
+
 `RF.Oversample` maps to SoapyLMS7's `OVERSAMPLING`: with a ratio of N the LMS7002M runs its
-converter at N × the host rate and decimates on chip, so `ogn-rf` still receives 1 MSps. It
-**defaults to the highest meaningful ratio, 32** — the converter tops out near 61.44 MSps and the
-host rate is 1 MSps — and is set before `setSampleRate()`, which is what configures the chain. If a
-device cannot deliver the host rate with that ratio, the open retries once with auto instead of
-failing, because the host rate matters to the rest of ogn-rf and the ratio does not.
+converter at N × the host rate and decimates on chip, so `ogn-rf` still receives `RF.SampleRate`.
+The requested value is **stepped down to the largest power of two the converter can run at** — 32 at
+1 MSps, 16 at 2 MSps, since 32 × 2 MSps would need a 64 MSps converter past the 61.44 MSps ceiling.
+It is set before `setSampleRate()`, which is what configures the chain, and if a device cannot
+deliver the host rate with the ratio it was given the open retries once with auto rather than
+failing. Requested and applied are both reported: `RF.Oversample  32 (auto) / applied 16`.
 
 Two measured caveats, so nobody expects a win that is not there. First, oversampling buys nothing
 for OGN on this link: a native 1 MSps capture and a 4 MSps capture normalise to the same in-band
