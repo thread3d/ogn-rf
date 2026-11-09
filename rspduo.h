@@ -253,6 +253,22 @@ class RSPDuo
    int           RspDuoMode;         // sdrplay_api_RspDuoModeT: Single_Tuner is the default
    int           DualMode;           // 1 when the open used Dual_Tuner (both tuners streaming)
 
+   // --- selection diversity ------------------------------------------------------------------
+   // Both tuners on the SAME frequency, decided per read by whichever has more signal energy.
+   // This is the cheap end of diversity: it needs no phase calibration and no combining maths,
+   // only that the two antennas fade independently. Maximal-ratio combining would need the
+   // ~117 deg inter-tuner phase offset (measured, stable) tracked continuously.
+   int           Diversity;          // 1 = selection diversity between the two tuners
+   int           DivLastTuner;       // tuner chosen last time, for hysteresis
+   double        DivSwitchdB;        // only switch when the other tuner is this much better
+   uint8_t      *DivBuf[2];          // scratch: both streams drained before choosing
+   size_t        DivBufBytes;
+   uint64_t      DivChoseA;          // times tuner A won
+   uint64_t      DivChoseB;          // times tuner B won
+   uint64_t      DivSwitches;        // times the choice actually changed
+   double        DivPowerA;          // [dB] last measured energy, tuner A
+   double        DivPowerB;          // [dB] last measured energy, tuner B
+
    // --- what the device actually did, for the status page --------------------------------------
    double        SampleRateApplied;  // [Hz]
    double        FreqApplied;        // [Hz] nominal centre frequency
@@ -269,6 +285,8 @@ class RSPDuo
      memset(&Device, 0, sizeof(Device));
      Gains=0; FreqRaster=0;
      TunerBEnabled=0; FreqBApplied=0; BOverflows=0;
+     Diversity=0; DivLastTuner=0; DivSwitchdB=1.0; DivBuf[0]=DivBuf[1]=0; DivBufBytes=0;
+     DivChoseA=0; DivChoseB=0; DivSwitches=0; DivPowerA=0; DivPowerB=0;
      Callback=0; CallbackContext=0;
      #ifndef __MACH__
      RefClock=CLOCK_REALTIME;
@@ -598,7 +616,10 @@ class RSPDuo
        //
        // Tuner B defaults to the second OGN channel, Frequency + 100 kHz, which for a 868.300
        // centre is 868.400 - so out of the box the two tuners carry the two OGN channels.
-       if(FreqB==0.0) FreqB=(double)Frequency+100000.0;
+       // Selection diversity needs both tuners looking at the same channel; without it the second
+       // tuner defaults to the neighbouring OGN channel.
+       if(Diversity)      FreqB=(double)Frequency;
+       else if(FreqB==0.0) FreqB=(double)Frequency+100000.0;
        DualCombo(Rate, Decimation);
        BwType=DualBw; IfType=DualIf;
        printf("RSPduo::Open() => dual-tuner mode: %5.3f MHz ADC, bw %d kHz, IF %d kHz, decimate by %d "
@@ -658,8 +679,14 @@ class RSPDuo
      // --- sample rings -------------------------------------------------------------------------
      // Size by time, not by samples, so dual mode (a quarter of the rate) still buffers about half
      // a second per tuner.
-     size_t RingBytes=(size_t)(SampleRateApplied*2.0*0.5);
-     if(RingBytes<(1u<<19)) RingBytes=(1u<<19);        // never smaller than 512 KiB
+     // A ring has to hold MORE than one ogn-rf read window (RF.OGN.SensTime, 0.85 s by default).
+     // In selection diversity both rings are drained in one call, and they must be drained
+     // sequentially, so while tuner A is being read for 0.85 s tuner B is still filling. If the
+     // ring were smaller than the window, B would overflow during A's read, discard its samples
+     // and force a second full wait - which measured as 2 reads in 22 s and a 9 % Live Time.
+     // Two seconds of headroom costs 4 MB per tuner and removes that entirely.
+     size_t RingBytes=(size_t)(SampleRateApplied*2.0*2.0);
+     if(RingBytes<(1u<<20)) RingBytes=(1u<<20);        // never smaller than 1 MiB
      if(Ring[0].Allocate(RingBytes)<0)
      { printf("RSPduo::Open() => cannot allocate the tuner A ring\n"); Close(); return -1; }
      if(DualMode && Ring[1].Allocate(RingBytes)<0)
@@ -707,6 +734,8 @@ class RSPDuo
      if(ApiOpen) { sdrplay_api_Close(); ApiOpen=0; }
 
      for(int T=0; T<2; T++) Ring[T].Free();
+     for(int T=0; T<2; T++) { free(DivBuf[T]); DivBuf[T]=0; }
+     DivBufBytes=0;
      TunerBEnabled=0; Gains=0; }
 
    // -----------------------------------------------------------------------------------------------
@@ -825,6 +854,15 @@ class RSPDuo
        if(Err!=sdrplay_api_Success)
        { printf("RSPduo::setCenterFreq(%d) => Update() failed: %s\n", Frequency, sdrplay_api_GetErrorString(Err));
          return -1; } }
+
+     // Diversity is only meaningful if both tuners see the same channel, so tuner B follows A.
+     if(Diversity && TunerBEnabled && Params->rxChannelB)
+     { FreqB=(double)Frequency; FreqBApplied=FreqB;
+       Params->rxChannelB->tunerParams.rfFreq.rfHz=(double)Frequency;
+       Params->rxChannelB->tunerParams.rfFreq.syncUpdate=1;
+       if(Streaming)
+         sdrplay_api_Update(Device.dev, sdrplay_api_Tuner_B,
+                            sdrplay_api_Update_Tuner_Frf, sdrplay_api_Update_Ext1_None); }
      return 0; }
 
    uint32_t getCenterFreq(void) { return (uint32_t)FreqApplied; }
@@ -906,9 +944,40 @@ class RSPDuo
    // Streaming: drain the ring
    // -----------------------------------------------------------------------------------------------
 
+   // Enable selection diversity. Only meaningful in dual-tuner mode; the caller is expected to
+   // keep both tuners on one frequency (setCenterFreq does that once this is on).
+   void setSelectionDiversity(int On)
+   { Diversity = On ? 1 : 0; DivLastTuner=0; }
+
+   // Effective only when the open really is dual-tuner; the flag itself is just the request.
+   bool haveDiversity(void) { return Diversity!=0 && TunerBEnabled!=0; }
+   int  getDivLastTuner(void) { return DivLastTuner; }
+   double getDivPower(int Tuner) { return Tuner ? DivPowerB : DivPowerA; }
+   uint64_t getDivChoseA(void) { return DivChoseA; }
+   uint64_t getDivChoseB(void) { return DivChoseB; }
+   uint64_t getDivSwitches(void) { return DivSwitches; }
+
+   // Energy of a buffer of interleaved 8-bit unsigned I/Q. The decision metric is the STRONGEST
+   // short block rather than the whole-buffer mean, because an OGN packet is a burst: averaging
+   // over 0.85 s of mostly noise washes out exactly the thing being selected for.
+   static double BlockPeakPowerdB(const uint8_t *Buf, int Samples, int BlockSamples)
+   { if(Buf==0 || Samples<=0) return -1e9;
+     if(BlockSamples<=0) BlockSamples=1024;
+     double Best=0;
+     for(int Start=0; Start<Samples; Start+=BlockSamples)
+     { int End=Start+BlockSamples; if(End>Samples) End=Samples;
+       double Acc=0;
+       for(int Idx=Start; Idx<End; Idx++)
+       { int vi=(int)Buf[2*Idx]-128, vq=(int)Buf[2*Idx+1]-128;
+         Acc += (double)vi*vi + (double)vq*vq; }
+       if(Acc>Best) Best=Acc; }
+     return 10.0*log10(Best + 1e-30); }
+
    // Flush anything already queued, for one tuner (default A) or both.
    int ResetBuffer(int Tuner=0)
-   { if(Tuner<0) { Ring[0].Flush(); Ring[1].Flush(); }
+   { // Selection diversity reads both rings each call, so both have to be flushed together or the
+     // losing tuner's stale samples would be compared against the winner's fresh ones.
+     if(Tuner<0 || Diversity) { Ring[0].Flush(); Ring[1].Flush(); }
      else if(Tuner<2) Ring[Tuner].Flush();
      return 0; }
 
@@ -919,8 +988,53 @@ class RSPDuo
      if(!Ring[Tuner].isOpen()) return -1;
      return Ring[Tuner].Pop(Buffer, Samples); }
 
+   // Selection diversity: drain both tuners over the same window and hand back whichever saw more
+   // signal. Both rings are drained every call - the loser cannot be left to overflow, or it could
+   // never win a later slot when it is the one in a fade-free position.
+   int ReadDiversity(SampleBuffer<uint8_t> &Out, int Samples)
+   { if(!Streaming || !Ring[0].isOpen() || !Ring[1].isOpen()) return -1;
+     int Use=Samples & 0xFFFFFF00;
+     if(Use<=0) return 0;
+     size_t Want=2*(size_t)Use;
+     if(DivBufBytes<Want)
+     { for(int T=0; T<2; T++) { free(DivBuf[T]); DivBuf[T]=0; }
+       DivBuf[0]=(uint8_t *)malloc(Want);
+       DivBuf[1]=(uint8_t *)malloc(Want);
+       if(DivBuf[0]==0 || DivBuf[1]==0) { DivBufBytes=0; return -1; }
+       DivBufBytes=Want; }
+
+     // A first: it blocks until the slot has been captured. Both tuners stream off the same clock,
+     // so by the time A is complete B already holds the same window and its read returns at once.
+     int GotA=Ring[0].Pop(DivBuf[0], Use);
+     int GotB=Ring[1].Pop(DivBuf[1], Use);
+
+     DivPowerA=(GotA>0) ? BlockPeakPowerdB(DivBuf[0], GotA, 1024) : -1e9;
+     DivPowerB=(GotB>0) ? BlockPeakPowerdB(DivBuf[1], GotB, 1024) : -1e9;
+
+     int Choose;
+     if(GotA<=0)            Choose=1;
+     else if(GotB<=0)       Choose=0;
+     else if(DivLastTuner==0) Choose=(DivPowerB > DivPowerA+DivSwitchdB) ? 1 : 0;
+     else                     Choose=(DivPowerA > DivPowerB+DivSwitchdB) ? 0 : 1;
+
+     if(Choose!=DivLastTuner) DivSwitches++;
+     DivLastTuner=Choose;
+     if(Choose) DivChoseB++; else DivChoseA++;
+
+     int      Got=Choose ? GotB : GotA;
+     uint8_t *Src=Choose ? DivBuf[1] : DivBuf[0];
+     memcpy(Out.Data, Src, 2*(size_t)Got);
+
+     double Time=getTime();
+     Out.Full=Got*2;
+     Out.Rate=getSampleRate();
+     Out.Freq=getCenterFreq();
+     Out.Time=Time-(double)Got/Out.Rate;
+     return Got; }
+
    int Read(SampleBuffer<uint8_t> &Buffer, int Samples, int Tuner=0)
    { if(Buffer.Allocate(2,Samples)<=0) return 0;
+     if(haveDiversity() && Tuner==0) return ReadDiversity(Buffer, Samples);
      int ReadSamples=Read(Buffer.Data, Samples, Tuner);
      double Time=getTime();
      if(ReadSamples>0)

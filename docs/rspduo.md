@@ -187,6 +187,45 @@ second time, halving the reported rate. A unit test pins the whole mapping down.
 Dual-tuner mode uses the same mechanism but the API chooses the factor itself, as part of the fixed
 combinations described above.
 
+## Selection diversity
+
+`RF.RSPduo.SelectionDiversity = 1` puts **both tuners on the same frequency** and, on every read,
+hands ogn-rf whichever tuner saw more signal.
+
+This is the cheap end of diversity: no phase calibration, no combining maths, and by construction
+it can never be worse than the better of the two antennas. Maximal-ratio combining would gain up to
+3 dB more, but it needs the inter-tuner phase offset tracked continuously — that offset was measured
+at a stable **+116.6 deg, +-3.8 deg over one second**, so MRC is physically possible if ever wanted.
+
+Both tuners are phase-coherent because they share one ADC clock, which is the one thing the vendor
+says dual-tuner mode cannot separate.
+
+### The decision metric
+
+The strongest 1024-sample block (1 ms at 1 MSps) rather than the mean over the whole read. An OGN
+packet is a burst lasting a few milliseconds inside an 0.85 s window; averaging over the whole
+window buries exactly the thing being selected for.
+
+Hysteresis of 1 dB stops it toggling on noise: the other tuner has to be 1 dB better to take over.
+
+### Two things that had to be right
+
+**Both rings are drained every read**, including the loser's. Leaving the loser undrained would let
+it overflow and then it could never win a later slot when it happened to be the one clear of a fade.
+
+**The rings have to hold more than one read window.** They are drained sequentially, so while tuner A
+is being read for 0.85 s tuner B is still filling. Sized at 0.5 s this overflowed B during every
+read and cost a second full wait: measured 2 reads in 22 s and a 9 % Live Time. At 2 s of headroom
+(zero extra cost that matters — 4 MB per tuner) it returns to the dual-mode baseline, 18.2 %.
+
+### Antenna spacing
+
+At 868.3 MHz, lambda = 34.5 cm, so lambda/2 = **17.3 cm**. Vertical separation is what decorrelates
+the ground-bounce multipath that causes fades on low-elevation aircraft; horizontal spacing mostly
+decorrelates azimuthal scatter. Avoid a full wavelength horizontally — a two-element array at d = lambda
+has an array factor of 2*cos(pi*sin(theta)), i.e. lobes at broadside *and* endfire with nulls at
++-30 deg, which is a pattern that can put aircraft in a null.
+
 ## Sample rate
 
 In single-tuner mode the RSPduo's ADC produces **2, 6 or 8 MHz** and nothing else. A requested rate

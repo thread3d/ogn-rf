@@ -309,6 +309,49 @@ class SDR_Device
 #endif
    }
 
+   // RSPduo only: selection diversity between the two tuners (both on one frequency, the
+   // stronger one used per read). Ignored by every other radio.
+   void setRspDuoSelectionDiversity(int On)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) Rsp.setSelectionDiversity(On);
+#else
+     (void)On;
+#endif
+   }
+
+   bool haveRspDuoDiversity(void)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.haveDiversity();
+#endif
+     return false;
+   }
+
+   uint64_t getRspDuoDivChoseA(void)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.getDivChoseA();
+#endif
+     return 0;
+   }
+
+   uint64_t getRspDuoDivChoseB(void)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.getDivChoseB();
+#endif
+     return 0;
+   }
+
+   uint64_t getRspDuoDivSwitches(void)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.getDivSwitches();
+#endif
+     return 0;
+   }
+
    // RSPduo only: is the second tuner live, and where is it tuned?
    bool haveTunerB(void)
    {
