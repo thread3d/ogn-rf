@@ -54,19 +54,36 @@ splicing them onto the new one would fake a continuous stream across two differe
 ### 2. Two tuners, two streams, two separate I/Q arrays
 
 The API delivers I and Q as two separate `short` arrays per stream (`xi[]`, `xq[]`), not
-interleaved, and an RSPduo has an A and a B tuner. This backend runs **tuner A only**, in
-`Single_Tuner` mode.
+interleaved, and an RSPduo has an A and a B tuner.
 
-That is a deliberate choice. ogn-rf needs one window of spectrum around 868.300 MHz, and the
-RSPduo's 2 MHz of bandwidth already spans both European OGN channels (868.200 and 868.400) with
-room to spare — so the second tuner would buy nothing for OGN and would double the sample traffic
-over a USB 2.0 link. `sdrplay_api_RspDuoMode_Dual_Tuner` is wired through `setRspDuoMode()` for
-anyone who wants it, but it takes effect at the next `Open()` and is not exercised by ogn-rf.
+**Both tuners can run at once.** `RF.RSPduo.DualTuner = 1` selects `Dual_Tuner` mode, and the
+status page then shows a second row, `Tuner B (dual mode)`, carrying tuner B's own frequency.
+`Single_Tuner` (the default) uses tuner A alone.
 
-Worth knowing if dual-tuner mode is ever enabled: **`sdrplay_api_Init()` resets channel B's
-settings to channel A's.** Channel B must be reconfigured with `sdrplay_api_Update()` *after*
-`Init()` returns, not before. This is documented in the reference implementations
-(`dual-tuner-recorder` notes it explicitly) and is easy to miss.
+Why single-tuner is the default: ogn-rf needs one window of spectrum around 868.300 MHz, and one
+tuner's 2 MHz of bandwidth already spans both European OGN channels (868.200 and 868.400). The
+second tuner buys nothing for that and doubles the sample traffic over USB 2.0. Dual mode exists
+because it is the RSPduo's distinguishing feature and the reason its reference tools
+(DuoTools, SDRduoDisplay, DuoDX-recorder, dual-tuner-recorder) are written the way they are.
+
+Dual mode is much more constrained than it looks:
+
+| | Single_Tuner | Dual_Tuner |
+|---|---|---|
+| IF | `IF_Zero` | **`IF_Zero` is not valid** — 450 kHz at a 2 MHz ADC |
+| Bandwidth | 1.536 MHz | 0.200 / 0.300 / 0.600 MHz |
+| Output rate | 2 Msps | 500 ksps (bw 0.2/0.3) or 1 Msps (bw 0.6) |
+
+Only a fixed set of (ADC rate, bandwidth, IF, internal decimation) combinations is accepted;
+anything else makes `sdrplay_api_Init()` fail. Those are the combinations the backend allows.
+
+And the trap the reference implementations warn about, which is real: **`sdrplay_api_Init()`
+resets channel B's settings to channel A's.** Tuner B's own frequency must be written *after*
+`Init()` returns and pushed down with a `sdrplay_api_Update()` on `sdrplay_api_Tuner_B`. Doing it
+before `Init()` silently leaves both tuners on the same band — it looks like it works while
+receiving the same spectrum twice. `ReconfigureTunerB()` does this, and it is verified on hardware
+by tuning the two tuners to bands far apart and confirming their spectra differ (+16.9 dB of FM
+content on one, +1.3 dB of nothing on the other).
 
 ### 3. The device is a daemon client
 

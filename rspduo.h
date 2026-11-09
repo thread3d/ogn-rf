@@ -87,6 +87,121 @@
 #include "thread.h"
 
 // ==================================================================================================
+//
+// One tuner's sample ring: the bridge from the API's callback thread to Read().
+//
+// Factored out of RSPDuo so dual-tuner mode uses the same logic twice instead of a second copy.
+// Each ring is independent - its own lock, its own condition variable, its own overrun count - so
+// a slow reader on one tuner cannot stall the other.
+//
+// ==================================================================================================
+
+class RSPDuo_Ring
+{ public:
+   uint8_t        *Buffer;         // interleaved 8-bit unsigned I/Q
+   size_t          Size;           // capacity in bytes
+   size_t          Head;           // read position
+   size_t          Full;           // bytes currently stored
+   pthread_mutex_t Lock;
+   pthread_cond_t  Cond;           // signalled by the callback, waited on by Pop()
+   int             Stopped;        // set by Stop() to unblock a waiting Pop()
+
+   uint64_t        Overflows;      // buffers dropped because the ring was full
+   uint64_t        Buffers;        // stream buffers received
+   uint64_t        BytesRead;      // bytes delivered (1 sample = 2 bytes: I/Q)
+
+   RSPDuo_Ring()
+   { Buffer=0; Size=0; Head=0; Full=0; Stopped=0; Overflows=0; Buffers=0; BytesRead=0;
+     pthread_mutex_init(&Lock, 0); pthread_cond_init(&Cond, 0); }
+
+  ~RSPDuo_Ring()
+   { Free(); pthread_mutex_destroy(&Lock); pthread_cond_destroy(&Cond); }
+
+   int Allocate(size_t Bytes)
+   { Free();
+     Buffer=(uint8_t *)malloc(Bytes);
+     if(Buffer==0) return -1;
+     Size=Bytes; Head=0; Full=0; Stopped=0; Overflows=0; Buffers=0; BytesRead=0;
+     return 0; }
+
+   void Free(void)
+   { if(Buffer) { free(Buffer); Buffer=0; } Size=0; Head=0; Full=0; }
+
+   bool isOpen(void) const { return Buffer!=0; }
+
+   void Flush(void)
+   { pthread_mutex_lock(&Lock); Head=0; Full=0; pthread_mutex_unlock(&Lock); }
+
+   void Stop(void)
+   { pthread_mutex_lock(&Lock); Stopped=1; pthread_cond_broadcast(&Cond); pthread_mutex_unlock(&Lock); }
+
+   // Convert one API buffer (separate int16 I and Q arrays) into interleaved u8, and append it.
+   void Push(const short *xi, const short *xq, unsigned int N, int Shift, int Reset)
+   { if(N==0 || Buffer==0) return;
+     size_t Bytes=2*(size_t)N;
+
+     pthread_mutex_lock(&Lock);
+     if(Stopped) { pthread_mutex_unlock(&Lock); return; }
+
+     // Reset!=0 means the API restarted the stream (tuner or rate change). The queued samples
+     // belong to the old configuration, so discard them: keeping them would splice two different
+     // centre frequencies into one continuous stream.
+     if(Reset) { Head=0; Full=0; }
+
+     // Not enough room: drop the whole backlog rather than deliver a torn buffer. A real overrun,
+     // so it is counted and reported.
+     if(Full+Bytes>Size) { Head=0; Full=0; Overflows++; }
+
+     size_t Tail=(Head+Full)%Size;
+     size_t First=Bytes;
+     if(First>Size-Tail) First=Size-Tail;
+     size_t Second=Bytes-First;
+
+     for(size_t Idx=0; Idx<First/2; Idx++)
+     { int vi=(xi[Idx]>>Shift)+128; if(vi<0) vi=0; else if(vi>255) vi=255;
+       int vq=(xq[Idx]>>Shift)+128; if(vq<0) vq=0; else if(vq>255) vq=255;
+       Buffer[Tail+2*Idx]  =(uint8_t)vi;
+       Buffer[Tail+2*Idx+1]=(uint8_t)vq; }
+     for(size_t Idx=0; Idx<Second/2; Idx++)
+     { size_t Src=First/2+Idx;
+       int vi=(xi[Src]>>Shift)+128; if(vi<0) vi=0; else if(vi>255) vi=255;
+       int vq=(xq[Src]>>Shift)+128; if(vq<0) vq=0; else if(vq>255) vq=255;
+       Buffer[2*Idx]  =(uint8_t)vi;
+       Buffer[2*Idx+1]=(uint8_t)vq; }
+
+     Full+=Bytes;
+     Buffers++;
+     BytesRead+=Bytes;
+     pthread_cond_signal(&Cond);
+     pthread_mutex_unlock(&Lock); }
+
+   // Block until Samples interleaved u8 samples are available, or the ring is stopped.
+   int Pop(uint8_t *Dst, int Samples)
+   { Samples&=0xFFFFFF00;                    // multiple of 256, as in rtlsdr.h
+     if(Samples<=0) return 0;
+     size_t Want=2*(size_t)Samples;
+     size_t Done=0;
+
+     pthread_mutex_lock(&Lock);
+     while(Done<Want)
+     { if(Stopped) { pthread_mutex_unlock(&Lock); return -1; }
+       if(Full==0) { pthread_cond_wait(&Cond, &Lock); continue; }
+       size_t Take=Want-Done; if(Take>Full) Take=Full;
+       size_t First=Take;
+       if(First>Size-Head) First=Size-Head;
+       memcpy(Dst+Done, Buffer+Head, First);
+       if(Take>First) memcpy(Dst+Done+First, Buffer, Take-First);
+       Head=(Head+Take)%Size;
+       Full-=Take;
+       Done+=Take; }
+     pthread_mutex_unlock(&Lock);
+     return (int)(Done/2); }
+
+} ;
+
+// ==================================================================================================
+
+// ==================================================================================================
 
 class RSPDuo
 { public:
@@ -104,18 +219,14 @@ class RSPDuo
 
    uint32_t      FreqRaster;        // [Hz] use only multiples of this base value to avoid tuning errors
 
-   // --- ring buffer: the bridge from the API's callback thread to our blocking Read() ---------
-   uint8_t      *Ring;              // interleaved 8-bit unsigned I/Q, as Read() wants it
-   size_t        RingBytes;         // capacity in bytes
-   size_t        RingHead;          // read position
-   size_t        RingFull;          // bytes currently stored
-   pthread_mutex_t RingLock;
-   pthread_cond_t  RingCond;        // signalled by the callback, waited on by Read()
-   int           Stopped;           // set by Close()/CancelAsync() to unblock a waiting Read()
+   // --- sample rings: the bridge from the API's callback thread to our blocking Read() --------
+   // One per tuner. In single-tuner mode only [0] exists; in dual-tuner mode both do, and they
+   // are independent so neither can stall the other.
+   RSPDuo_Ring   Ring[2];
 
-   uint64_t      Overflows;         // buffers dropped because the ring was full
-   uint64_t      Buffers;           // stream buffers received
-   uint64_t      BytesRead;         // counts number of bytes delivered (1 sample = 2 bytes: I/Q)
+   int           TunerBEnabled;     // 1 when running in Dual_Tuner mode
+   double        FreqBApplied;      // [Hz] tuner B centre frequency
+   uint64_t      BOverflows;        // tuner B ring overruns, for the status page
 
    int         (*Callback)(uint8_t *Buffer, int Samples, double SampleTime, double SamplePeriod, void *Contex);
    void         *CallbackContext;
@@ -140,10 +251,12 @@ class RSPDuo
    int           BiasTee;            // [bool] requested bias tee state (no such hardware)
    int           DcOffsetCorrect;    // 1 = let the API notch DC and correct IQ imbalance
    int           RspDuoMode;         // sdrplay_api_RspDuoModeT: Single_Tuner is the default
+   int           DualMode;           // 1 when the open used Dual_Tuner (both tuners streaming)
 
    // --- what the device actually did, for the status page --------------------------------------
    double        SampleRateApplied;  // [Hz]
    double        FreqApplied;        // [Hz] nominal centre frequency
+   double        FreqB;              // [Hz] tuner B centre frequency (dual mode only)
    int           FreqCorr;           // [ppm] pushed straight into devParams->ppm
    double        GaindBApplied;      // [dB] total gain the API reports as in use
    char          DeviceSerNo[SDRPLAY_MAX_SER_NO_LEN];
@@ -155,9 +268,7 @@ class RSPDuo
    { DeviceIndex=0; Params=0; ApiOpen=0; Streaming=0; DeviceSerNo[0]=0; HardwareVer=0; ApiVersion=0;
      memset(&Device, 0, sizeof(Device));
      Gains=0; FreqRaster=0;
-     Ring=0; RingBytes=0; RingHead=0; RingFull=0; Stopped=0;
-     pthread_mutex_init(&RingLock, 0); pthread_cond_init(&RingCond, 0);
-     Overflows=0; Buffers=0; BytesRead=0;
+     TunerBEnabled=0; FreqBApplied=0; BOverflows=0;
      Callback=0; CallbackContext=0;
      #ifndef __MACH__
      RefClock=CLOCK_REALTIME;
@@ -165,12 +276,13 @@ class RSPDuo
      AverPeriod=100.0;
      SamplePeriod=1.0/2000000.0; SampleTime=0; StartTime=0; PrevTime=0; SampleTime_DMS=0.0001*0.0001;
      GainOffset=115.8; GRdB_set=GR_DB_MIN; LNAstate=0; BiasTee=(-1); DcOffsetCorrect=1;
-     RspDuoMode=sdrplay_api_RspDuoMode_Single_Tuner;
+     RspDuoMode=sdrplay_api_RspDuoMode_Single_Tuner; DualMode=0;
+     DualBw=sdrplay_api_BW_0_600; DualIf=sdrplay_api_IF_0_450; DualDecimation=2;
+     FreqB=0;
      SampleRateApplied=0; FreqApplied=0; FreqCorr=0; GaindBApplied=0; }
 
   ~RSPDuo()
-   { Close();
-     pthread_mutex_destroy(&RingLock); pthread_cond_destroy(&RingCond); }
+   { Close(); }
 
    bool isOpen(void) const { return Streaming!=0; }
 
@@ -245,7 +357,12 @@ class RSPDuo
    static void StaticStreamACb(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params,
                                unsigned int numSamples, unsigned int reset, void *cbContext)
    { RSPDuo *This=(RSPDuo *)cbContext;
-     if(This) This->ClassStreamACb(xi, xq, params, numSamples, reset); }
+     if(This) This->ClassStreamCb(0, xi, xq, params, numSamples, reset); }
+
+   static void StaticStreamBCb(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params,
+                               unsigned int numSamples, unsigned int reset, void *cbContext)
+   { RSPDuo *This=(RSPDuo *)cbContext;
+     if(This) This->ClassStreamCb(1, xi, xq, params, numSamples, reset); }
 
    static void StaticEventCb(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner,
                              sdrplay_api_EventParamsT *params, void *cbContext)
@@ -263,47 +380,19 @@ class RSPDuo
    // member so it can be re-measured on other units without touching this code.
    int           Shift;
 
-   void ClassStreamACb(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params,
-                       unsigned int numSamples, unsigned int reset)
+   // One entry point for both tuners. The conversion and buffering live in RSPDuo_Ring; what is
+   // left here is the timestamp bookkeeping, which is shared state and must therefore be updated
+   // from one stream only.
+   void ClassStreamCb(int Tuner, short *xi, short *xq, sdrplay_api_StreamCbParamsT *params,
+                      unsigned int numSamples, unsigned int reset)
    { (void)params;                               // firstSampleNum/grChanged are not needed here
-     if(numSamples==0) return;
-     size_t Bytes=2*(size_t)numSamples;
+     if(numSamples==0 || Tuner<0 || Tuner>1) return;
+     Ring[Tuner].Push(xi, xq, numSamples, Shift, reset);
 
-     pthread_mutex_lock(&RingLock);
-     if(Stopped) { pthread_mutex_unlock(&RingLock); return; }
-
-     // reset!=0 means the API restarted the stream (a tuner or rate change). The samples in the
-     // ring belong to the old configuration, so throw them away: keeping them would splice two
-     // different centre frequencies into one continuous stream.
-     if(reset) { RingHead=0; RingFull=0; }
-
-     // Not enough room: drop the whole backlog rather than deliver a torn buffer. This is a real
-     // overrun (the reader fell behind), so it is counted and reported.
-     if(RingFull+Bytes>RingBytes)
-     { RingHead=0; RingFull=0; Overflows++; }
-
-     size_t Tail=(RingHead+RingFull)%RingBytes;
-     size_t First=Bytes;
-     if(First>RingBytes-Tail) First=RingBytes-Tail;
-     size_t Second=Bytes-First;
-
-     for(size_t Idx=0; Idx<First/2; Idx++)
-     { int vi=(xi[Idx]>>Shift)+128; if(vi<0) vi=0; else if(vi>255) vi=255;
-       int vq=(xq[Idx]>>Shift)+128; if(vq<0) vq=0; else if(vq>255) vq=255;
-       Ring[Tail+2*Idx]  =(uint8_t)vi;
-       Ring[Tail+2*Idx+1]=(uint8_t)vq; }
-     for(size_t Idx=0; Idx<Second/2; Idx++)
-     { size_t Src=First/2+Idx;
-       int vi=(xi[Src]>>Shift)+128; if(vi<0) vi=0; else if(vi>255) vi=255;
-       int vq=(xq[Src]>>Shift)+128; if(vq<0) vq=0; else if(vq>255) vq=255;
-       Ring[2*Idx]  =(uint8_t)vi;
-       Ring[2*Idx+1]=(uint8_t)vq; }
-
-     RingFull+=Bytes;
-     Buffers++;
-     BytesRead+=Bytes;
-     pthread_cond_signal(&RingCond);
-     pthread_mutex_unlock(&RingLock);
+     // Timestamps follow the first tuner only. Both tuners in dual mode run off the same clock at
+     // the same rate, so feeding this from both would simply double the sample count and make the
+     // averaged sample period nonsense.
+     if(Tuner!=0) return;
 
      // The timing model copied from RTLSDR::ClassCallback, so that ogn-rf's sample timestamps
      // keep the same meaning they have with an RTL-SDR dongle.
@@ -320,7 +409,7 @@ class RSPDuo
 
    void ClassEventCb(sdrplay_api_EventT eventId, sdrplay_api_TunerSelectT tuner,
                      sdrplay_api_EventParamsT *params)
-   { (void)tuner;                                // single-tuner mode: only tuner A is in use
+   { (void)tuner;                                // gain reports are shared by both tuners
      switch(eventId)
      { case sdrplay_api_GainChange:
          if(params)
@@ -374,6 +463,39 @@ class RSPDuo
      return Best; }
 
    // -----------------------------------------------------------------------------------------------
+   // Dual-tuner mode: a much stricter set of valid combinations
+   //
+   // In Dual_Tuner mode the two tuners share one ADC clock, so the API imposes a fixed
+   // relationship between the ADC rate, the analog bandwidth, the IF and the internal
+   // decimation. Unlike single-tuner mode, IF_Zero is NOT among the valid combinations, and a
+   // combination outside this table makes sdrplay_api_Init() fail. The pairs come from the
+   // reference dual-tuner-recorder implementation and are checked against them here.
+   //
+   // At a 2 MHz ADC rate the usable settings are:
+   //     bw 0.200 or 0.300  ->  IF 450 kHz, decimate by 4  ->  500 ksps out per tuner
+   //     bw 0.600           ->  IF 450 kHz, decimate by 2  -> 1000 ksps out per tuner
+   //
+   // 500 ksps with a 200 kHz filter is ample for one OGN channel, whose signal is about 100 kHz
+   // wide, so the default is bw 0.200. The trade against single-tuner mode is real: one tuner
+   // there gives 2 MSps covering both channels at once, whereas dual mode gives each channel its
+   // own tuner and its own narrow filter at a quarter of the rate.
+   // -----------------------------------------------------------------------------------------------
+
+   sdrplay_api_Bw_MHzT  DualBw;          // analog bandwidth per tuner in dual mode
+   sdrplay_api_If_kHzT  DualIf;          // IF, which dual mode cannot set to zero
+   int                  DualDecimation;  // internal decimation the API applies
+
+   void DualCombo(double &Rate, int &Decimation)
+   { Rate=2000000.0;
+     switch(DualBw)
+     { case sdrplay_api_BW_0_600: DualIf=sdrplay_api_IF_0_450; Decimation=2; break;
+       case sdrplay_api_BW_0_300: DualIf=sdrplay_api_IF_0_450; Decimation=4; break;
+       case sdrplay_api_BW_0_200:
+       default:                    DualBw=sdrplay_api_BW_0_200;
+                                   DualIf=sdrplay_api_IF_0_450; Decimation=4; break; }
+     DualDecimation=Decimation; }
+
+   // -----------------------------------------------------------------------------------------------
    // Open / Close
    // -----------------------------------------------------------------------------------------------
 
@@ -423,10 +545,21 @@ class RSPDuo
      HardwareVer=Device.hwVer;
      strncpy(DeviceSerNo, Device.SerNo, SDRPLAY_MAX_SER_NO_LEN-1); DeviceSerNo[SDRPLAY_MAX_SER_NO_LEN-1]=0;
 
-     // Tuner A, single-tuner mode. This is the mode that needs no second device and no licence.
-     Device.tuner       = sdrplay_api_Tuner_A;
-     Device.rspDuoMode  = (sdrplay_api_RspDuoModeT)RspDuoMode;
-     Device.rspDuoSampleFreq = 0.0;            // only meaningful in Dual_Tuner / Master mode
+     // Single_Tuner uses tuner A alone; Dual_Tuner drives both tuners off one clock, which is
+     // the RSPduo's distinguishing feature and needs no second device. In dual mode the device
+     // must be declared as Tuner_Both and rspDuoSampleFreq must carry the shared rate before the
+     // device is selected - the API rejects the init otherwise.
+     DualMode = ((RspDuoMode==sdrplay_api_RspDuoMode_Dual_Tuner) ? 1 : 0);
+     if(DualMode)
+     { double Rate; int Dec;
+       DualCombo(Rate, Dec);
+       Device.tuner       = sdrplay_api_Tuner_Both;
+       Device.rspDuoMode  = sdrplay_api_RspDuoMode_Dual_Tuner;
+       Device.rspDuoSampleFreq = Rate; }
+     else
+     { Device.tuner       = sdrplay_api_Tuner_A;
+       Device.rspDuoMode  = (sdrplay_api_RspDuoModeT)RspDuoMode;
+       Device.rspDuoSampleFreq = 0.0; }
 
      Err=sdrplay_api_SelectDevice(&Device);
      sdrplay_api_UnlockDeviceApi();
@@ -444,25 +577,54 @@ class RSPDuo
        Close(); return -1; }
 
      int Decimation=1;
-     double Rate=SnapSampleRate((double)SampleRate, Decimation);
-     if((uint32_t)fabs(Rate-SampleRate)>1)
-       printf("RSPduo::Open() => %d Hz requested, the RSPduo gives %8.1f Hz%s\n",
-              SampleRate, Rate, Decimation>1 ? " (with on-chip decimation)" : "");
+     double Rate;
+     sdrplay_api_Bw_MHzT BwType;
+     sdrplay_api_If_kHzT IfType;
+
+     if(DualMode)
+     { // Dual mode picks its own rate/bandwidth/IF/decimation: the API only accepts the fixed
+       // combinations documented above, so nothing here is negotiable.
+       //
+       // 0.6 MHz is the default bandwidth because the two European OGN channels are 200 kHz
+       // apart and a 0.2 MHz filter centred between them would sit on neither. It gives 1 Msps
+       // per tuner instead of 500 ksps, which is still well above what one OGN channel needs.
+       //
+       // Tuner B defaults to the second OGN channel, Frequency + 100 kHz, which for a 868.300
+       // centre is 868.400 - so out of the box the two tuners carry the two OGN channels.
+       if(FreqB==0.0) FreqB=(double)Frequency+100000.0;
+       DualCombo(Rate, Decimation);
+       BwType=DualBw; IfType=DualIf;
+       printf("RSPduo::Open() => dual-tuner mode: %5.3f MHz ADC, bw %d kHz, IF %d kHz, decimate by %d "
+              "=> %5.3f Msps per tuner\n",
+              1e-6*Rate, (int)BwType, (int)IfType, Decimation,
+              1e-6*Rate/(double)Decimation); }
+     else
+     { Rate=SnapSampleRate((double)SampleRate, Decimation);
+       if((uint32_t)fabs(Rate-SampleRate)>1)
+         printf("RSPduo::Open() => %d Hz requested, the RSPduo gives %8.1f Hz%s\n",
+                SampleRate, Rate, Decimation>1 ? " (with on-chip decimation)" : "");
+       BwType=sdrplay_api_BW_1_536; IfType=sdrplay_api_IF_Zero; }
 
      Params->devParams->fsFreq.fsHz    = Rate;
      Params->devParams->ppm            = (double)FreqCorr;
      Params->devParams->mode           = sdrplay_api_BULK;   // bulk is the robust choice on USB
 
-     if(Params->rxChannelA)
-     { sdrplay_api_TunerParamsT   &Tuner=Params->rxChannelA->tunerParams;
-       sdrplay_api_ControlParamsT &Ctrl =Params->rxChannelA->ctrlParams;
+     if(Params->rxChannelA==0)
+     { printf("RSPduo::Open() => the API returned no channel A parameters\n"); Close(); return -1; }
 
-       Tuner.rfFreq.rfHz      = (double)Frequency;
+     // Channel A. Both channels are configured identically here; in dual mode the API then
+     // overwrites B with A's settings during Init(), and the differences are re-applied
+     // afterwards by ReconfigureTunerB().
+     for(int Ch=0; Ch<2; Ch++)
+     { sdrplay_api_RxChannelParamsT *Chan=(Ch==0) ? Params->rxChannelA : Params->rxChannelB;
+       if(Chan==0) continue;
+       sdrplay_api_TunerParamsT   &Tuner=Chan->tunerParams;
+       sdrplay_api_ControlParamsT &Ctrl =Chan->ctrlParams;
+
+       Tuner.rfFreq.rfHz      = (Ch==0) ? (double)Frequency : FreqB;
        Tuner.rfFreq.syncUpdate= 1;
-       // 1.536 MHz is the widest filter below a 2 MSps stream: it covers both European OGN
-       // channels (868.200 and 868.400) around a 868.300 centre with room to spare.
-       Tuner.bwType           = sdrplay_api_BW_1_536;
-       Tuner.ifType           = sdrplay_api_IF_Zero;
+       Tuner.bwType           = BwType;
+       Tuner.ifType           = IfType;
        Tuner.loMode           = sdrplay_api_LO_Auto;
        Tuner.gain.gRdB        = GRdB_set;
        Tuner.gain.LNAstate    = (unsigned char)LNAstate;
@@ -476,26 +638,30 @@ class RSPDuo
        Ctrl.decimation.enable = (Decimation>1) ? 1 : 0;
        Ctrl.decimation.decimationFactor = (unsigned char)(Decimation>1 ? Decimation : 1);
        Ctrl.agc.enable        = sdrplay_api_AGC_DISABLE;   // manual gain: ogn-rf owns the gain
-
-       SampleRateApplied = Rate/(double)(Decimation>1 ? Decimation : 1);
      }
-     else
-     { printf("RSPduo::Open() => the API returned no channel A parameters\n"); Close(); return -1; }
 
+     SampleRateApplied = Rate/(double)(Decimation>1 ? Decimation : 1);
      SamplePeriod=1.0/SampleRateApplied;
      FreqApplied=(double)Frequency;
+     FreqBApplied=DualMode ? FreqB : 0.0;
      FreqRaster=0;
 
-     // --- ring buffer --------------------------------------------------------------------------
-     RingBytes=(size_t)1<<21;                  // 2 MiB = 1 M samples = 0.5 s at 2 MSps
-     Ring=(uint8_t *)malloc(RingBytes);
-     if(Ring==0) { printf("RSPduo::Open() => cannot allocate the sample ring\n"); Close(); return -1; }
-     RingHead=0; RingFull=0; Stopped=0; Overflows=0; Buffers=0; BytesRead=0;
+     // --- sample rings -------------------------------------------------------------------------
+     // Size by time, not by samples, so dual mode (a quarter of the rate) still buffers about half
+     // a second per tuner.
+     size_t RingBytes=(size_t)(SampleRateApplied*2.0*0.5);
+     if(RingBytes<(1u<<19)) RingBytes=(1u<<19);        // never smaller than 512 KiB
+     if(Ring[0].Allocate(RingBytes)<0)
+     { printf("RSPduo::Open() => cannot allocate the tuner A ring\n"); Close(); return -1; }
+     if(DualMode && Ring[1].Allocate(RingBytes)<0)
+     { printf("RSPduo::Open() => cannot allocate the tuner B ring\n"); Close(); return -1; }
+     TunerBEnabled = DualMode;
+     BOverflows=0;
 
      // --- start the stream ---------------------------------------------------------------------
      sdrplay_api_CallbackFnsT CbFns;
      CbFns.StreamACbFn=StaticStreamACb;
-     CbFns.StreamBCbFn=0;                      // tuner B is not used in single-tuner mode
+     CbFns.StreamBCbFn=DualMode ? StaticStreamBCb : 0;   // tuner B only exists in dual mode
      CbFns.EventCbFn  =StaticEventCb;
 
      StartTime=SampleTime=PrevTime=getTime();
@@ -506,16 +672,24 @@ class RSPDuo
        Close(); return -1; }
      Streaming=1;
 
+     // sdrplay_api_Init() RESETS channel B to channel A's values. Anything tuner B needs that
+     // differs from A - here its centre frequency - must therefore be written AFTER Init returns
+     // and pushed down with a tuner-B update. Doing it before Init silently leaves both tuners on
+     // tuner A's frequency, which looks like it works and receives the same band twice.
+     if(DualMode) { if(ReconfigureTunerB()<0) { Close(); return -1; } }
+
      BuildGainTable();
 
-     printf("RSPduo::Open() => %8.3f MHz, %8.3f Msps, gain reduction %4.1f dB, LNA state %d\n",
-            1e-6*FreqApplied, 1e-6*SampleRateApplied, (double)GRdB_set, LNAstate);
+     printf("RSPduo::Open() => tuner A %8.3f MHz%s, %8.3f Msps, gain reduction %4.1f dB, LNA state %d\n",
+            1e-6*FreqApplied, DualMode ? " + tuner B both streaming" : "",
+            1e-6*SampleRateApplied, (double)GRdB_set, LNAstate);
      return 1; }
 
    void Close(void)
-   { if(Streaming && Device.dev)
-     { pthread_mutex_lock(&RingLock); Stopped=1; pthread_cond_broadcast(&RingCond); pthread_mutex_unlock(&RingLock);
-       sdrplay_api_Uninit(Device.dev); }
+   { // Stop both rings first, so a Read() blocked on either wakes up instead of hanging.
+     for(int T=0; T<2; T++) Ring[T].Stop();
+
+     if(Streaming && Device.dev) sdrplay_api_Uninit(Device.dev);
      Streaming=0; Params=0;
 
      if(Device.dev)
@@ -523,12 +697,38 @@ class RSPDuo
 
      if(ApiOpen) { sdrplay_api_Close(); ApiOpen=0; }
 
-     if(Ring) { free(Ring); Ring=0; RingBytes=0; }
-     RingHead=0; RingFull=0; Stopped=0; Gains=0; }
+     for(int T=0; T<2; T++) Ring[T].Free();
+     TunerBEnabled=0; Gains=0; }
 
    // -----------------------------------------------------------------------------------------------
    // Gain
    //
+   // -----------------------------------------------------------------------------------------------
+   // Dual mode: push tuner B's differences after Init()
+   // -----------------------------------------------------------------------------------------------
+
+   int ReconfigureTunerB(void)
+   { if(Params==0 || Params->rxChannelB==0) return 0;
+
+     sdrplay_api_ReasonForUpdateT Reason=sdrplay_api_Update_None;
+
+     if(fabs(Params->rxChannelB->tunerParams.rfFreq.rfHz - FreqB)>0.5)
+     { Params->rxChannelB->tunerParams.rfFreq.rfHz=FreqB;
+       Params->rxChannelB->tunerParams.rfFreq.syncUpdate=1;
+       Reason=(sdrplay_api_ReasonForUpdateT)(Reason|sdrplay_api_Update_Tuner_Frf); }
+
+     if(Reason==sdrplay_api_Update_None) return 0;
+
+     sdrplay_api_ErrT Err=sdrplay_api_Update(Device.dev, sdrplay_api_Tuner_B,
+                                             Reason, sdrplay_api_Update_Ext1_None);
+     if(Err!=sdrplay_api_Success)
+     { printf("RSPduo::ReconfigureTunerB() => Update(%08x) failed: %s\n",
+              (unsigned)Reason, sdrplay_api_GetErrorString(Err));
+       return -1; }
+     printf("RSPduo::Open() => tuner B tuned to %8.3f MHz (channel B re-applied after Init)\n",
+            1e-6*FreqB);
+     return 0; }
+
    // The RSPduo has no gain table: gain is the pair (IF gain reduction, LNA state). What it does
    // have is a simple, measurable law, established on this unit at 868.3 MHz (docs/hardware.md):
    //
@@ -620,6 +820,17 @@ class RSPDuo
 
    uint32_t getCenterFreq(void) { return (uint32_t)FreqApplied; }
 
+   // Tuner B, dual mode only. Setting it before Open() also sets the frequency Open() will use
+   // for channel B; setting it afterwards retunes channel B live.
+   void setCenterFreqB(uint32_t Frequency)
+   { FreqB=(double)Frequency;
+     if(!DualMode || Params==0 || Params->rxChannelB==0) return;
+     FreqBApplied=(double)Frequency;
+     ReconfigureTunerB(); }
+
+   uint32_t getCenterFreqB(void) { return (uint32_t)(DualMode ? FreqBApplied : 0); }
+   bool     haveTunerB(void)     { return TunerBEnabled!=0; }
+
    // Real ppm control, straight into the API - no software shift, unlike the LimeSDR backend.
    int setFreqCorrection(int PPM)
    { FreqCorr=PPM;
@@ -686,53 +897,38 @@ class RSPDuo
    // Streaming: drain the ring
    // -----------------------------------------------------------------------------------------------
 
-   int ResetBuffer(void)                            // flush anything already queued
-   { pthread_mutex_lock(&RingLock);
-     RingHead=0; RingFull=0;
-     pthread_mutex_unlock(&RingLock);
+   // Flush anything already queued, for one tuner (default A) or both.
+   int ResetBuffer(int Tuner=0)
+   { if(Tuner<0) { Ring[0].Flush(); Ring[1].Flush(); }
+     else if(Tuner<2) Ring[Tuner].Flush();
      return 0; }
 
-   // Blocks until Samples are available, copying interleaved 8-bit unsigned I/Q out. Returns the
-   // number of samples delivered, or -1 when the stream has stopped.
-   int Read(uint8_t *Buffer, int Samples)
-   { if(!Streaming) return -1;
-     Samples&=0xFFFFFF00;                          // multiple of 256, as in rtlsdr.h
-     if(Samples<=0) return 0;
-     size_t Want=2*(size_t)Samples;
-     size_t Done=0;
+   // Blocks until Samples interleaved 8-bit unsigned I/Q are available. Tuner 0 is A, 1 is B;
+   // ogn-rf reads tuner A, and tuner B is available through the same call.
+   int Read(uint8_t *Buffer, int Samples, int Tuner=0)
+   { if(!Streaming || Tuner<0 || Tuner>1) return -1;
+     if(!Ring[Tuner].isOpen()) return -1;
+     return Ring[Tuner].Pop(Buffer, Samples); }
 
-     pthread_mutex_lock(&RingLock);
-     while(Done<Want)
-     { if(Stopped) { pthread_mutex_unlock(&RingLock); return -1; }
-       if(RingFull==0)
-       { pthread_cond_wait(&RingCond, &RingLock);
-         continue; }
-       size_t Take=Want-Done; if(Take>RingFull) Take=RingFull;
-       size_t First=Take;
-       if(First>RingBytes-RingHead) First=RingBytes-RingHead;
-       memcpy(Buffer+Done, Ring+RingHead, First);
-       if(Take>First) memcpy(Buffer+Done+First, Ring, Take-First);
-       RingHead=(RingHead+Take)%RingBytes;
-       RingFull-=Take;
-       Done+=Take; }
-     pthread_mutex_unlock(&RingLock);
-
-     return (int)(Done/2); }
-
-   int Read(SampleBuffer<uint8_t> &Buffer, int Samples)
+   int Read(SampleBuffer<uint8_t> &Buffer, int Samples, int Tuner=0)
    { if(Buffer.Allocate(2,Samples)<=0) return 0;
-     int ReadSamples=Read(Buffer.Data, Samples);
+     int ReadSamples=Read(Buffer.Data, Samples, Tuner);
      double Time=getTime();
      if(ReadSamples>0)
      { Buffer.Full=ReadSamples*2;
        Buffer.Rate=getSampleRate();
-       Buffer.Freq=getCenterFreq();
+       Buffer.Freq=(Tuner==1) ? getCenterFreqB() : getCenterFreq();
        Buffer.Time=Time-(double)ReadSamples/Buffer.Rate; }
      return ReadSamples; }
 
+   // Samples taken off tuner A and B so far, for the status page.
+   uint64_t getBytesRead (int Tuner=0) { return Ring[Tuner<2?Tuner:0].BytesRead; }
+   uint64_t getOverflows (int Tuner=0) { return Ring[Tuner<2?Tuner:0].Overflows; }
+   uint64_t getBuffers   (int Tuner=0) { return Ring[Tuner<2?Tuner:0].Buffers; }
+
    // ogn-rf reads synchronously, so acquisition is already running once Open() returns.
    int CancelAsync(void)
-   { pthread_mutex_lock(&RingLock); Stopped=1; pthread_cond_broadcast(&RingCond); pthread_mutex_unlock(&RingLock);
+   { Ring[0].Stop(); Ring[1].Stop();
      return 0; }
 
    // Accepted for interface parity with RTLSDR; with a synchronous Read() the loop lives in

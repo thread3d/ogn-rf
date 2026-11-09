@@ -294,15 +294,36 @@ class SDR_Device
      if(Type==RSP_DUO)  return Rsp.setBiasTee(On);
      return RTL.setBiasTee(On); }
 
-   // RSPduo only: sdrplay_api_RspDuoMode_Single_Tuner (default) or _Dual_Tuner. Takes effect at
-   // the next Open(), because the mode is fixed when the device is selected.
-   void setRspDuoMode(int Mode)
+   // RSPduo only: Dual!=0 runs both tuners at once, 0 is single-tuner (the default). Takes effect
+   // at the next Open(), because the mode is fixed when the device is selected.
+   //
+   // A plain flag rather than the vendor's sdrplay_api_RspDuoModeT: that type only exists when
+   // USE_RSPDUO is defined, and ogn-rf.cc must still compile without it.
+   void setRspDuoDualTuner(int Dual)
    {
 #ifdef USE_RSPDUO
-     if(Type==RSP_DUO) Rsp.setRspDuoMode(Mode);
+     if(Type==RSP_DUO) Rsp.setRspDuoMode(Dual ? sdrplay_api_RspDuoMode_Dual_Tuner
+                                              : sdrplay_api_RspDuoMode_Single_Tuner);
 #else
-     (void)Mode;
+     (void)Dual;
 #endif
+   }
+
+   // RSPduo only: is the second tuner live, and where is it tuned?
+   bool haveTunerB(void)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.haveTunerB();
+#endif
+     return false;
+   }
+
+   uint32_t getCenterFreqB(void)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.getCenterFreqB();
+#endif
+     return 0;
    }
 
    // -----------------------------------------------------------------------------------------------

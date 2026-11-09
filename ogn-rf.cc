@@ -86,6 +86,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
 
    int  DeviceType;                             // 0=RTL-SDR, 1=LimeSDR, 2=RSPduo, see sdr.h
    int  Oversample;                             // [LimeSDR] on-chip decimation ratio, 0 = driver decides
+   int  DualTuner;                              // [RSPduo] drive both tuners at once
    char ClockSource[16];                        // [LimeSDR] "internal" / "external", empty = leave alone
    double ReferenceRate;                        // [LimeSDR] external reference clock rate [Hz], 0 = leave alone
    int  DeviceIndex;                            // rtl-sdr device index
@@ -151,7 +152,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     OGN_GainMode=1; OGN_Gain=600;
     HoppingPlan.setPlan(0);
     PulseFilt.Threshold=0;
-    DeviceType=SDR_Device::RTL_SDR; DeviceIndex=0; DeviceSerial[0]=0; Oversample=0;
+    DeviceType=SDR_Device::RTL_SDR; DeviceIndex=0; DeviceSerial[0]=0; Oversample=0; DualTuner=0;
     ClockSource[0]=0; ReferenceRate=0;
     OffsetTuning=0; FreqCorr=0; FreqRaster=28125; BiasTee=(-1);
     // GSM_CenterFreq=GSM_LowEdge+GSM_ScanStep/2; GSM_Scan=1; GSM_SamplesPerRead=(250*SampleRate)/1000; GSM_Gain=200;
@@ -191,6 +192,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     config_lookup_int(Config,   "RF.OfsTune",        &OffsetTuning);
     config_lookup_int(Config,   "RF.BiasTee",        &BiasTee);
     config_lookup_int(Config,   "RF.OGN.GainMode",   &OGN_GainMode);
+    config_lookup_int(Config,   "RF.RSPduo.DualTuner", &DualTuner);   // RSPduo: both tuners at once
 
     config_lookup_int(Config,   "RF.OGN.SaveRawData",   &OGN_SaveRawData);
 
@@ -345,6 +347,9 @@ Content-Disposition: attachment; filename=\"%s_%07.3fMHz_%03.1fMsps_%10dsec.jpg\
        }
        else                                                                // if not open yet or was closed due to an error
        { SDR.setType(DeviceType);                                          // RTL-SDR dongle or LimeSDR
+         // The RSPduo mode has to be chosen before Open(): the API fixes it when the device is
+         // selected, so setting it afterwards would silently do nothing.
+         SDR.setRspDuoDualTuner(DualTuner);
          SDR.setOversample(Oversample);                                    // must precede Open()
          SDR.setClockSource(ClockSource);                                  // must precede Open()
          SDR.setReferenceRate(ReferenceRate);
@@ -993,6 +998,9 @@ Refresh: 5\r\n\
 #endif
        dprintf(Client->SocketFile, "<tr><td>Center frequency</td><td align=right><b>%7.3f MHz</b></td></tr>\n",        1e-6*RF->SDR.getCenterFreq());
        dprintf(Client->SocketFile, "<tr><td>Sample rate</td><td align=right><b>%5.3f MHz</b></td></tr>\n",             1e-6*RF->SDR.getSampleRate());
+       if(RF->SDR.haveTunerB())
+         dprintf(Client->SocketFile, "<tr><td>Tuner B (dual mode)</td><td align=right><b>%7.3f MHz</b></td></tr>\n",
+                 1e-6*RF->SDR.getCenterFreqB());
        dprintf(Client->SocketFile, "<tr><td>Frequency correction</td><td align=right><b>%+5.1f ppm</b></td></tr>\n",   RF->FreqCorr + RF->GSM_FreqCorr);
        dprintf(Client->SocketFile, "<tr><td>Live Time</td><td align=right><b>%5.1f%%</b></td></tr>\n",         100*RF->getLifeTime());
        uint32_t RtlFreq, TunerFreq; RF->SDR.getXtalFreq(RtlFreq, TunerFreq);
