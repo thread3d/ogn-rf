@@ -96,8 +96,9 @@ class LimeSDR
 
    uint32_t      FreqRaster;        // [Hz] use only multiples of this base value to avoid tuning errors
 
-   int           Oversample;        // ADC-to-host rate ratio: 0 = driver decides, N = capture N x rate
-                                    // and decimate by N inside the LMS7002M before it reaches us
+   int           Oversample;        // requested ADC-to-host rate ratio: 0 = driver decides,
+                                    // N = capture N x rate and decimate by N inside the LMS7002M
+   int           OversampleApplied; // what the device actually accepted (0 = driver decided)
 
    uint32_t      Freq;              // [Hz] nominal (uncorrected) centre frequency
    int           FreqCorr;          // [ppm] software frequency correction
@@ -120,7 +121,7 @@ class LimeSDR
    LimeSDR()
    { DeviceIndex=0; DeviceSerial[0]=0; Device=0; Stream=0;
      Mtu=0; Scratch=0; Shift=8; ReadTimeoutUs=250000; MaxTimeouts=8;
-     Gains=0; FreqRaster=0; Freq=0; FreqCorr=0; Oversample=0;
+     Gains=0; FreqRaster=0; Freq=0; FreqCorr=0; Oversample=32; OversampleApplied=0;
      GainMode=1; GaindB=0; BiasTee=(-1);
      Antenna=(-1); AntennaName[0][0]=0;
      BytesRead=0; SamplePeriod=1e-6; }
@@ -188,26 +189,42 @@ class LimeSDR
 
      try
      {
-       // Oversampling decides how the LMS7002M reaches the rate asked for below: with a ratio of
-       // N the converter runs at N x the host rate and the on-chip CIC/FIR chain decimates by N.
-       // It has to be in place BEFORE setSampleRate(), which configures the chain.
+       // Sample rate configuration, with the on-chip capture/decimate ratio applied first.
        //
-       // Measured on this board it changes nothing for OGN at 868 MHz: the receiver there is
-       // limited by antenna noise, not by converter resolution, so decimating cannot manufacture
-       // SNR that the antenna is not delivering (the in-band noise density with and without it
-       // agrees to ~0.1 dB). It is exposed because it is the right knob where the analogue noise
-       // is low enough that the converter floor matters, and because a sharper on-chip
-       // decimation filter helps when a strong signal sits just outside the passband.
-       if(Oversample>0)
-       { try { Device->writeSetting("OVERSAMPLING", std::to_string(Oversample)); }
-         catch(const std::exception &Ex) { printf("LimeSDR::Open() => OVERSAMPLING=%d rejected: %s\n", Oversample, Ex.what()); } }
+       // Oversampling decides how the LMS7002M reaches the host rate: with a ratio of N the
+       // converter runs at N x the host rate and the on-chip CIC/FIR chain decimates by N, so
+       // ogn-rf still receives SampleRate while the chip captures N times faster. It has to be
+       // set BEFORE setSampleRate(), which is what configures the chain.
+       //
+       // The default asks for the highest ratio the converter can actually use (see
+       // RF.Oversample). If a driver or a gateware build cannot deliver the host rate with that
+       // ratio, the open is retried once with the ratio left to the driver rather than failing:
+       // a rate the rest of ogn-rf depends on matters more than the ratio.
+       double ActualRate = 0;
+       int    AppliedRatio = 0;
+       bool   Configured = false;
 
-       // Sample rate next: the analogue filter and the calibration depend on it
-       Device->setSampleRate(SOAPY_SDR_RX, Channel, (double)SampleRate);
-       double ActualRate=Device->getSampleRate(SOAPY_SDR_RX, Channel);
+       if(Oversample>0)
+       { try
+         { Device->writeSetting("OVERSAMPLING", std::to_string(Oversample));
+           Device->setSampleRate(SOAPY_SDR_RX, Channel, (double)SampleRate);
+           ActualRate=Device->getSampleRate(SOAPY_SDR_RX, Channel);
+           if(fabs(ActualRate-SampleRate)<=0.5) { AppliedRatio=Oversample; Configured=true; }
+           else printf("LimeSDR::Open() => OVERSAMPLING=%d gave %8.1f Hz for %d Hz, retrying with auto\n",
+                       Oversample, ActualRate, SampleRate); }
+         catch(const std::exception &Ex)
+         { printf("LimeSDR::Open() => OVERSAMPLING=%d rejected (%s), retrying with auto\n", Oversample, Ex.what()); } }
+
+       if(!Configured)
+       { try { Device->writeSetting("OVERSAMPLING", "0"); } catch(const std::exception &Ex) {}
+         Device->setSampleRate(SOAPY_SDR_RX, Channel, (double)SampleRate);
+         ActualRate=Device->getSampleRate(SOAPY_SDR_RX, Channel);
+         AppliedRatio=0; }
+
        if(fabs(ActualRate-SampleRate)>0.5)
          printf("LimeSDR::Open() => sample rate %d asked, %8.1f Hz delivered\n", SampleRate, ActualRate);
        SamplePeriod=1.0/ActualRate;
+       OversampleApplied=AppliedRatio;
 
        // Select the LNA path that matches the frequency, when the driver lets us choose
        SelectAntenna((double)Frequency);
@@ -233,8 +250,9 @@ class LimeSDR
      catch(const std::exception &Ex)
      { printf("LimeSDR::Open() => %s\n", Ex.what()); Close(); return -1; }
 
-     printf("LimeSDR::Open(%d,%d,%d) => %s, %8.3f MHz, %5.3f Msps, MTU=%d\n",
-            DeviceIndex, Frequency, SampleRate, getDeviceName(), 1e-6*getCenterFreq(), 1e-6*getSampleRate(), Mtu);
+     printf("LimeSDR::Open(%d,%d,%d) => %s, %8.3f MHz, %5.3f Msps, MTU=%d, oversampling %d\n",
+            DeviceIndex, Frequency, SampleRate, getDeviceName(), 1e-6*getCenterFreq(), 1e-6*getSampleRate(), Mtu,
+            OversampleApplied>0 ? OversampleApplied : 0);
      PrintGains();
      return 1; }
 

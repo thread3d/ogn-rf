@@ -58,7 +58,7 @@ RF = {
   OfsTune      = 0;
   FreqCorr     = 0;
   SampleRate   = 1000000;
-  Oversample   = 0;              // on-chip capture/decimate ratio; 0 = driver decides
+  Oversample   = 32;             // on-chip capture/decimate ratio; 0 = driver decides
   OGN = { Gain = 61.0; GainMode = 1; SampleRate = 1000000;
           SensTime = 0.85; StartTime = 0.375; };
 };
@@ -98,13 +98,20 @@ discrete tuner gain table. `MTU=2040` is what SoapyLMS7 negotiates; a 0.85 s slo
 | bias tee | accepted and ignored — a LimeSDR-USB has none |
 | offset tuning | accepted and ignored — an RTL-SDR/E4000 concept |
 
-`RF.Oversample` maps to SoapyLMS7's `OVERSAMPLING` setting: with a ratio of N the LMS7002M runs its
-converter at N × the host rate and decimates on chip, so `ogn-rf` still receives 1 MSps. It is
-implemented and wired up, but **it measures as neutral for OGN here** — a native 1 MSps capture and
-a 4 MSps capture normalise to the same in-band noise density (−88.1 vs −88.9 dBFS/Hz), and
-`OVERSAMPLING` 0/2/8/16 all land within 0.1 dB of each other, because at 868 MHz with an antenna the
-receiver is limited by sky noise rather than converter resolution. It is the right knob where that
-is not true (short antenna, low gain, the HF bands) and is left at 0 in the shipped configuration.
+`RF.Oversample` maps to SoapyLMS7's `OVERSAMPLING`: with a ratio of N the LMS7002M runs its
+converter at N × the host rate and decimates on chip, so `ogn-rf` still receives 1 MSps. It
+**defaults to the highest meaningful ratio, 32** — the converter tops out near 61.44 MSps and the
+host rate is 1 MSps — and is set before `setSampleRate()`, which is what configures the chain. If a
+device cannot deliver the host rate with that ratio, the open retries once with auto instead of
+failing, because the host rate matters to the rest of ogn-rf and the ratio does not.
+
+Two measured caveats, so nobody expects a win that is not there. First, oversampling buys nothing
+for OGN on this link: a native 1 MSps capture and a 4 MSps capture normalise to the same in-band
+noise density (−88.1 vs −88.9 dBFS/Hz), because at 868 MHz with an antenna the receiver is limited
+by sky noise, not converter resolution. Second, on this LimeSuite build the setting appears to be a
+**no-op entirely** — every ratio from 0 to 4096 is accepted and produces identical output, which a
+4096× ratio at a 1 MSps host rate obviously must be. The status page reports `RF.Oversample  32
+(auto) / applied 32`, and the open banner reports `oversampling 32`, so what happened is visible.
 
 Two of those are load-bearing:
 

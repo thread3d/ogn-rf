@@ -1018,7 +1018,8 @@ Refresh: 5\r\n\
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.FFTsize</td><td align=right><b>%d</b></td></tr>\n",                 FFT->Filter->FFTsize);
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.Threshold</td><td align=right><b>%3.1f</b></td></tr>\n",            FFT->Filter->Threshold);
      if(RF->SDR.HaveLimeSDR())
-       dprintf(Client->SocketFile, "<tr><td>RF.Oversample</td><td align=right><b>%d%s</b></td></tr>\n",                RF->Oversample, RF->Oversample?"":" (auto)");
+       dprintf(Client->SocketFile, "<tr><td>RF.Oversample</td><td align=right><b>%d (auto) / applied %d</b></td></tr>\n",
+               RF->Oversample, RF->SDR.getOversampleApplied());
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.GainMode</td><td align=right><b>%d</b></td></tr>\n",                 RF->OGN_GainMode);
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.Gain</td><td align=right><b>%4.1f dB</b></td></tr>\n",           0.1*RF->OGN_Gain);
      // dprintf(Client->SocketFile, "<tr><td>RF.OGN.CenterFreq</td><td align=right><b>%5.1f MHz</b></td></tr>\n",   1e-6*RF->OGN_CenterFreq);

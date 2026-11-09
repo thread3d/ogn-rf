@@ -144,6 +144,15 @@ class SDR_Device
      (void)Ratio;
 #endif
    }
+
+   // What the device actually accepted, for the status page: 0 means the driver chose.
+   int getOversampleApplied(void)
+   {
+#ifdef USE_LIMESDR
+     if(Type==LIME_SDR) return Lms.OversampleApplied;
+#endif
+     return 0;
+   }
    uint32_t getSampleRate(void)           { return (Type==LIME_SDR) ? Lms.getSampleRate()          : RTL.getSampleRate(); }
 
    // -----------------------------------------------------------------------------------------------
