@@ -91,10 +91,19 @@ samples in `int16` arrays. The conversion is the same one the LimeSDR backend us
 Val = (xi[i] >> Shift) + 128;   // Shift = 8, clamped to 0..255
 ```
 
-`Shift` is a member rather than a constant so the scale can be measured against a known signal and
-corrected without touching the conversion code. `Shift = 8` is the value to verify first on new
-hardware: if every level reads 12 dB low, the samples are left-justified differently than assumed
-and the shift belongs at 6.
+`Shift` is a member rather than a constant so the scale can be measured on new hardware and
+corrected without touching the conversion code.
+
+**`Shift = 8` is measured, not assumed.** Two independent checks on an RSPduo agreed:
+
+- At maximum gain with an antenna connected, the stream peaked at **21761 (−3.0 dBFS)** with **zero
+  clipping** out of 4 M values — so the sample scale really does reach the 16-bit rails.
+- The quantisation check reports that values are **not** all multiples of 2, 4 or 16, so no low
+  bits are unused and no narrower ADC is being left-justified into 16 bits.
+
+A weak-signal capture can look misleading here: at 40 dB of gain the same band peaked at only 1923,
+which looks like a scale error but is simply a signal 24 dB below full scale. The quantisation check
+is the one that settles it; a peak alone does not.
 
 ## Sample rate
 
@@ -110,12 +119,25 @@ plan expects them. Rates below 2 MHz are reached with the API's on-chip decimati
 ## Gain
 
 The RSPduo has no discrete tuner gain table. The API expresses gain as a pair: an IF gain reduction
-(`gRdB`, 20..59 dB) and an LNA state step. `setTunerGain()` therefore picks the LNA state that lands
-closest to the gain ogn-rf asks for, holding `gRdB` at 40 dB, and publishes a table built from the
-range the device itself reports. `getTunerGain()` reports what the API says is actually in use.
+(`gRdB`, 20..59 dB) and an LNA state step.
 
-Because the LNA step size is band dependent, the table is rebuilt on every `Open()` and after every
-gain change.
+Measured on this unit at 868.3 MHz, with the LNA at state 0, the law is simply:
+
+```
+total gain [dB] = 115.8 - gRdB        95.8 dB at gRdB 20, 56.8 dB at gRdB 59
+```
+
+`setTunerGain()` therefore treats ogn-rf's single gain number as a **total gain** and spends it on
+`gRdB`, clamping to the reachable 56.8–95.8 dB range. `115.8` is not hard-coded: the API reports
+the total gain it actually applied on every gain change, and the backend recalibrates its offset
+from that report, so the model corrects itself across units and bands.
+
+LNA state is held at 0 deliberately. It is the lowest-noise setting, and on a weak, noise-dominated
+band — which 868 MHz is here — noise figure limits reception, not gain. Measured at `gRdB` 20,
+stepping the LNA state down did not lower the noise floor at all; it only moved the reported gain.
+
+Because this is measured rather than assumed, the numbers are re-checkable with
+`rspduo_probe`; see the RSPduo repository's `docs/hardware.md` for the sweep.
 
 ## Frequency correction
 

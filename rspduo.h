@@ -130,8 +130,13 @@ class RSPDuo
    double        SampleTime_DMS;     // [sec^2] mean square variation of SampleTime
 
    // --- configuration that the caller sets before Open() ---------------------------------------
-   double        GRdB;               // [dB] IF gain reduction, 20..59 (API's "NORMAL" range)
-   int           LNAstate;           // LNA step, 0..RSPDUO_NUM_LNA_STATES-1
+   // Gain model, measured on this unit at 868.3 MHz: total gain = GainOffset - gRdB at LNA 0.
+   // GainOffset is recalibrated from the API's own gain-change reports (see ClassEventCb).
+   double        GainOffset;         // [dB] added to (0 - gRdB) to give the total gain
+   int           GRdB_set;           // [dB] IF gain reduction currently programmed, 20..59
+   int           LNAstate;           // LNA step; held at 0, the lowest-noise setting
+   static const int GR_DB_MIN = 20;  // API "NORMAL" minimum gain reduction
+   static const int GR_DB_MAX = 59;  // API maximum gain reduction (MAX_BB_GR)
    int           BiasTee;            // [bool] requested bias tee state (no such hardware)
    int           DcOffsetCorrect;    // 1 = let the API notch DC and correct IQ imbalance
    int           RspDuoMode;         // sdrplay_api_RspDuoModeT: Single_Tuner is the default
@@ -159,7 +164,7 @@ class RSPDuo
      #endif
      AverPeriod=100.0;
      SamplePeriod=1.0/2000000.0; SampleTime=0; StartTime=0; PrevTime=0; SampleTime_DMS=0.0001*0.0001;
-     GRdB=40.0; LNAstate=0; BiasTee=(-1); DcOffsetCorrect=1;
+     GainOffset=115.8; GRdB_set=GR_DB_MIN; LNAstate=0; BiasTee=(-1); DcOffsetCorrect=1;
      RspDuoMode=sdrplay_api_RspDuoMode_Single_Tuner;
      SampleRateApplied=0; FreqApplied=0; FreqCorr=0; GaindBApplied=0; }
 
@@ -247,10 +252,15 @@ class RSPDuo
    { RSPDuo *This=(RSPDuo *)cbContext;
      if(This) This->ClassEventCb(eventId, tuner, params); }
 
-   // 12-bit RSP samples arrive as int16. The shift maps them onto the 8-bit range with the same
-   // full scale as an RTL-SDR dongle (128 = zero), which is what everything downstream expects.
-   // Shift is a member rather than a constant so the scale can be measured against a known
-   // signal and corrected without touching this code - see docs/rspduo.md.
+   // RSP samples arrive as int16 and are shifted onto the 8-bit range with the same full scale as
+   // an RTL-SDR dongle (128 = zero), which is what everything downstream expects.
+   //
+   // Shift = 8 was measured on an RSPduo rather than assumed, in two independent ways. At maximum
+   // gain with an antenna connected the stream peaked at 21761 (-3.0 dBFS) with zero clipping out
+   // of 4 M values, i.e. the scale really does reach the 16-bit rails. And the quantisation check
+   // in rspduo_probe reports that sample values are not all multiples of 2, 4 or 16, so the full
+   // 16-bit range is in use and there are no unused low bits from a narrower ADC. It stays a
+   // member so it can be re-measured on other units without touching this code.
    int           Shift;
 
    void ClassStreamACb(short *xi, short *xq, sdrplay_api_StreamCbParamsT *params,
@@ -313,7 +323,13 @@ class RSPDuo
    { (void)tuner;                                // single-tuner mode: only tuner A is in use
      switch(eventId)
      { case sdrplay_api_GainChange:
-         if(params) GaindBApplied=params->gainParams.currGain;
+         if(params)
+         { GaindBApplied=params->gainParams.currGain;
+           // The API reports the total gain it actually applied, so the model's offset can be
+           // corrected from the device itself instead of relying on a constant measured once.
+           // total = offset - gRdB  =>  offset = total + gRdB.
+           double Offset=GaindBApplied + (double)params->gainParams.gRdB;
+           if(Offset>40.0 && Offset<200.0) GainOffset=Offset; }
          break;
        case sdrplay_api_PowerOverloadChange:
          // Report it, but do not act: a momentary overload is normal in a busy band and the
@@ -365,7 +381,7 @@ class RSPDuo
    { Close();
 
      this->DeviceIndex=DeviceIndex;
-     Shift=8;                                  // see docs/rspduo.md for how this was measured
+     Shift=8;                                  // measured, not assumed; see the note above
 
      // --- connect to the API service -----------------------------------------------------------
      sdrplay_api_ErrT Err=sdrplay_api_Open();
@@ -448,7 +464,7 @@ class RSPDuo
        Tuner.bwType           = sdrplay_api_BW_1_536;
        Tuner.ifType           = sdrplay_api_IF_Zero;
        Tuner.loMode           = sdrplay_api_LO_Auto;
-       Tuner.gain.gRdB        = (int)GRdB;
+       Tuner.gain.gRdB        = GRdB_set;
        Tuner.gain.LNAstate    = (unsigned char)LNAstate;
        Tuner.gain.minGr       = sdrplay_api_NORMAL_MIN_GR;
 
@@ -493,7 +509,7 @@ class RSPDuo
      BuildGainTable();
 
      printf("RSPduo::Open() => %8.3f MHz, %8.3f Msps, gain reduction %4.1f dB, LNA state %d\n",
-            1e-6*FreqApplied, 1e-6*SampleRateApplied, GRdB, LNAstate);
+            1e-6*FreqApplied, 1e-6*SampleRateApplied, (double)GRdB_set, LNAstate);
      return 1; }
 
    void Close(void)
@@ -513,21 +529,29 @@ class RSPDuo
    // -----------------------------------------------------------------------------------------------
    // Gain
    //
-   // The RSPduo has no gain table: gain is the pair (IF gain reduction, LNA state). The API fills
-   // gainVals with the resulting dB once a gain update has been applied, so the table published to
-   // ogn-rf is built from the device's own reported range rather than invented. It is rebuilt on
-   // every Open() and after every setTunerGain(), because it is band dependent.
+   // The RSPduo has no gain table: gain is the pair (IF gain reduction, LNA state). What it does
+   // have is a simple, measurable law, established on this unit at 868.3 MHz (docs/hardware.md):
+   //
+   //     total gain [dB] = GainOffset - gRdB          with LNA state 0
+   //
+   // where GainOffset measured 115.8 dB, so gRdB 20 gives 95.8 dB and gRdB 59 gives 56.8 dB.
+   // GainOffset is not hard-coded: the API reports the resulting total gain on every gain change,
+   // and ClassEventCb recalibrates the offset from that report. So the model is self-correcting
+   // across units and bands rather than trusting a constant measured once.
+   //
+   // LNA state is held at 0 deliberately. It is the lowest-noise setting, and on a weak, noise-
+   // dominated band - which 868 MHz is here - noise figure is what limits reception, not gain.
+   // Measured at gRdB 20, stepping the LNA state down did not lower the noise floor at all, it
+   // only moved the reported gain, so ogn-rf's single gain number is spent on the IF stage.
    // -----------------------------------------------------------------------------------------------
 
    void BuildGainTable(void)
    { Gains=0;
-     if(Params==0 || Params->rxChannelA==0) return;
-     double Max=Params->rxChannelA->tunerParams.gain.gainVals.max;
-     double Min=Params->rxChannelA->tunerParams.gain.gainVals.min;
-     if(!(Max>Min) || Max>200.0 || Min<(-200.0))
-     { // The API has not filled the range yet: fall back to the documented RSPduo envelope.
-       Max=59.0-GRdB+40.0; Min=59.0-GRdB; }
-     int Steps=RSPDUO_NUM_LNA_STATES;
+     // What ogn-rf can ask for: the totals reachable by sweeping gRdB at LNA state 0.
+     double Max=GainOffset-GR_DB_MIN;
+     double Min=GainOffset-GR_DB_MAX;
+     if(!(Max>Min)) return;
+     int Steps=32;
      for(int Idx=0; Idx<Steps && Idx<64; Idx++)
      { double dB=Max + (Min-Max)*((double)Idx/(double)(Steps-1));
        Gain[Idx]=(int)lround(10.0*dB); }
@@ -544,20 +568,23 @@ class RSPDuo
 
    int getTunerGain(void) { return (int)lround(10.0*GaindBApplied); }
 
-   // Accepts the gain ogn-rf asks for in 0.1 dB and picks the LNA state that lands closest, with
-   // the IF gain reduction held at GRdB. The gain change is applied live through Update().
+   // Accepts the gain ogn-rf asks for in 0.1 dB, treats it as a total gain, and spends it on the
+   // IF gain reduction at LNA state 0. A request above the maximum is clamped to maximum gain
+   // rather than rejected: on a quiet band the useful setting is the top of the range, and
+   // silently doing something quieter than asked would be the more surprising behaviour.
    int setTunerGain(int Requested)
    { if(Params==0 || Params->rxChannelA==0) return -1;
-     if(Gains<=0) BuildGainTable();
-     if(Gains<=0) return -1;
 
-     int Best=0; int BestErr=abs(Requested-Gain[0]);
-     for(int Idx=1; Idx<Gains; Idx++)
-       if(abs(Requested-Gain[Idx])<BestErr) { Best=Idx; BestErr=abs(Requested-Gain[Idx]); }
+     double Want=0.1*(double)Requested;
+     double GRdB=GainOffset-Want;
+     if(GRdB<GR_DB_MIN) GRdB=GR_DB_MIN;
+     if(GRdB>GR_DB_MAX) GRdB=GR_DB_MAX;
 
-     LNAstate=Best;
-     Params->rxChannelA->tunerParams.gain.gRdB     = (int)GRdB;
-     Params->rxChannelA->tunerParams.gain.LNAstate = (unsigned char)Best;
+     GRdB_set=(int)lround(GRdB);
+     LNAstate=0;
+
+     Params->rxChannelA->tunerParams.gain.gRdB     = GRdB_set;
+     Params->rxChannelA->tunerParams.gain.LNAstate = (unsigned char)LNAstate;
 
      if(Streaming)
      { sdrplay_api_ErrT Err=sdrplay_api_Update(Device.dev, sdrplay_api_Tuner_A,
