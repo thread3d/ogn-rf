@@ -36,17 +36,35 @@ SDR_FLAGS  = -DUSE_LIMESDR
 LIME_LIBS  = -lSoapySDR
 endif
 
+# SDRplay RSPduo support, through the SDRplay API 3.x (see rspduo.h and sdr.h). Unlike the
+# LimeSDR backend this needs no SoapySDR: libsdrplay_api is the vendor's own client library
+# and all hardware access lives in the sdrplay_apiService daemon. Auto-detected from the
+# vendor header, so any other build is unaffected; force it either way with
+# "make USE_RSPDUO=1" or "make USE_RSPDUO=0".
+RSPDUO_PREFIX ?= /usr/local
+ifndef USE_RSPDUO
+ifneq ("$(wildcard $(RSPDUO_PREFIX)/include/sdrplay_api.h)","")
+USE_RSPDUO = 1
+endif
+endif
+
+ifeq ($(USE_RSPDUO),1)
+# Separate from FLAGS for the same reason as SDR_FLAGS above.
+RSP_FLAGS  = -DUSE_RSPDUO -I$(RSPDUO_PREFIX)/include
+RSP_LIBS   = -L$(RSPDUO_PREFIX)/lib -Wl,-rpath,$(RSPDUO_PREFIX)/lib -lsdrplay_api
+endif
+
 all:    gsm_scan ogn-rf r2fft_test
 
-ogn-rf:       Makefile ogn-rf.cc sdr.h rtlsdr.h limesdr.h thread.h fft.h buffer.h image.h
-	g++ $(FLAGS) $(SDR_FLAGS) $(GPU_FLAGS) -o ogn-rf ogn-rf.cc $(GPU_SRC) $(LIBS) -lrtlsdr -lfftw3 -lfftw3f $(LIME_LIBS)
+ogn-rf:       Makefile ogn-rf.cc sdr.h rtlsdr.h limesdr.h rspduo.h thread.h fft.h buffer.h image.h
+	g++ $(FLAGS) $(SDR_FLAGS) $(RSP_FLAGS) $(GPU_FLAGS) -o ogn-rf ogn-rf.cc $(GPU_SRC) $(LIBS) -lrtlsdr -lfftw3 -lfftw3f $(LIME_LIBS) $(RSP_LIBS)
 ifdef USE_RPI_GPU_FFT
 	sudo chown root ogn-rf
 	sudo chmod a+s  ogn-rf
 endif
 
-gsm_scan:       Makefile gsm_scan.cc sdr.h rtlsdr.h limesdr.h fft.h buffer.h image.h
-	g++ $(FLAGS) $(SDR_FLAGS) $(GPU_FLAGS) -o gsm_scan gsm_scan.cc $(GPU_SRC) $(LIBS) -lrtlsdr -lfftw3 -lfftw3f $(LIME_LIBS)
+gsm_scan:       Makefile gsm_scan.cc sdr.h rtlsdr.h limesdr.h rspduo.h fft.h buffer.h image.h
+	g++ $(FLAGS) $(SDR_FLAGS) $(RSP_FLAGS) $(GPU_FLAGS) -o gsm_scan gsm_scan.cc $(GPU_SRC) $(LIBS) -lrtlsdr -lfftw3 -lfftw3f $(LIME_LIBS) $(RSP_LIBS)
 ifdef USE_RPI_GPU_FFT
 	sudo chown root gsm_scan
 	sudo chmod a+s gsm_scan

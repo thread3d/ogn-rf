@@ -32,7 +32,7 @@
 
 #include "thread.h"     // multi-thread stuff
 #include "fft.h"        // Fast Fourier Transform
-#include "sdr.h"        // SDR radio: RTL-SDR or LimeSDR, chosen by RF.DeviceType
+#include "sdr.h"        // SDR radio: RTL-SDR, LimeSDR or RSPduo, chosen by RF.DeviceType
 
 #define QUOTE(name) #name
 #define STR(macro) QUOTE(macro)
@@ -84,7 +84,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
                                                 // the goal is to listen on center frequency from 0.4 to 1.2 sec
    FreqPlan         HoppingPlan;                // frequency hopping plan (depends on the world region)
 
-   int  DeviceType;                             // 0=RTL-SDR, 1=LimeSDR, see sdr.h
+   int  DeviceType;                             // 0=RTL-SDR, 1=LimeSDR, 2=RSPduo, see sdr.h
    int  Oversample;                             // [LimeSDR] on-chip decimation ratio, 0 = driver decides
    char ClockSource[16];                        // [LimeSDR] "internal" / "external", empty = leave alone
    double ReferenceRate;                        // [LimeSDR] external reference clock rate [Hz], 0 = leave alone
@@ -180,7 +180,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     { strncpy(ClockSource, ClockSrc, 16); ClockSource[15]=0; }
     double RefRate = 0;                                               // LimeSDR: external reference rate [Hz]
     config_lookup_float_or_int(Config, "RF.ReferenceRate", &RefRate); ReferenceRate=RefRate;
-    const char *DeviceTypeName = 0;                                     // RF.DeviceType = "rtlsdr" or "limesdr"
+    const char *DeviceTypeName = 0;                 // RF.DeviceType = "rtlsdr", "limesdr" or "rspduo"
     if(config_lookup_string(Config,"RF.DeviceType", &DeviceTypeName)==CONFIG_TRUE)
       DeviceType=SDR_Device::getTypeByString(DeviceTypeName);
     else if(config_lookup_string(Config,"RF.SDR", &DeviceTypeName)==CONFIG_TRUE)   // accepted alias

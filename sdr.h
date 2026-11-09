@@ -24,14 +24,14 @@
 //
 // ogn-rf grew up around one radio, the RTL-SDR dongle, and the RF acquisition class talked to it
 // through the RTLSDR class in rtlsdr.h. This file keeps that interface but puts a switch in front
-// of it, so the same acquisition code can drive either a DVB-T dongle or a LimeSDR.
+// of it, so the same acquisition code can drive a DVB-T dongle, a LimeSDR or an SDRplay RSPduo.
 //
-// The two implementations are kept as plain members rather than through virtual inheritance: the
+// The implementations are kept as plain members rather than through virtual inheritance: the
 // classes are cheap, only one is ever open, and this way every call site in ogn-rf.cc keeps saying
 // "SDR.something(...)" with no pointer indirection or allocation to reason about.
 //
-// When SoapySDR is not present at build time, the LimeSDR backend is compiled out and RTLSDR is
-// used as an inert placeholder, so the branch still builds on a host that only has librtlsdr.
+// Each optional backend is compiled out when its library is missing, and RTLSDR is used as an
+// inert placeholder for it, so the branch still builds on a host that only has librtlsdr.
 //
 // ==================================================================================================
 
@@ -48,9 +48,15 @@
 typedef RTLSDR LimeSDR;            // inert placeholder, never selected: see HaveLimeSDR()
 #endif
 
+#ifdef USE_RSPDUO
+#include "rspduo.h"
+#else
+typedef RTLSDR RSPDuo;             // inert placeholder, never selected: see HaveRSPDuo()
+#endif
+
 class SDR_Device
 { public:
-   enum { RTL_SDR=0, LIME_SDR=1 };
+   enum { RTL_SDR=0, LIME_SDR=1, RSP_DUO=2 };
 
    int           Type;             // which backend is in use
    uint32_t      DeviceIndex;      // index of the device, as reported on the status page
@@ -58,6 +64,7 @@ class SDR_Device
 
    RTLSDR        RTL;
    LimeSDR       Lms;
+   RSPDuo        Rsp;
 
   public:
    SDR_Device() { Type=RTL_SDR; DeviceIndex=0; FreqRaster=0; }
@@ -72,19 +79,37 @@ class SDR_Device
 #endif
    }
 
-   static const char *getTypeName(int Type=RTL_SDR) { return (Type==LIME_SDR) ? "LimeSDR" : "RTL-SDR"; }
+   static bool HaveRSPDuo(void)
+   {
+#ifdef USE_RSPDUO
+     return true;
+#else
+     return false;
+#endif
+   }
+
+   static const char *getTypeName(int Type=RTL_SDR)
+   { if(Type==LIME_SDR) return "LimeSDR";
+     if(Type==RSP_DUO)  return "RSPduo";
+     return "RTL-SDR"; }
 
    static int getTypeByString(const char *Name)     // parse RF.DeviceType
    { if(Name==0) return RTL_SDR;
      if(strcasecmp(Name,"limesdr")==0) return LIME_SDR;
      if(strcasecmp(Name,"lime")==0)    return LIME_SDR;
      if(strcasecmp(Name,"soapy")==0)   return LIME_SDR;
+     if(strcasecmp(Name,"rspduo")==0)  return RSP_DUO;
+     if(strcasecmp(Name,"rsp-duo")==0) return RSP_DUO;
+     if(strcasecmp(Name,"sdrplay")==0) return RSP_DUO;
+     if(strcasecmp(Name,"duo")==0)     return RSP_DUO;
      return RTL_SDR; }
 
    int setType(int NewType)
    { if(isOpen()) return -1;                         // must not change a running radio
      if( (NewType==LIME_SDR) && !HaveLimeSDR() )     // asked for LimeSDR but it was not compiled in
      { printf("SDR: LimeSDR support was not compiled in (build with USE_LIMESDR=1)\n"); NewType=RTL_SDR; }
+     if( (NewType==RSP_DUO) && !HaveRSPDuo() )       // asked for RSPduo but it was not compiled in
+     { printf("SDR: RSPduo support was not compiled in (build with USE_RSPDUO=1)\n"); NewType=RTL_SDR; }
      Type=NewType; return Type; }
 
    int getType(void) { return Type; }
@@ -93,28 +118,52 @@ class SDR_Device
    // Life cycle
    // -----------------------------------------------------------------------------------------------
 
-   bool isOpen(void)         { return (Type==LIME_SDR) ? Lms.isOpen()       : RTL.isOpen(); }
-   void Close(void)          { if(Type==LIME_SDR) Lms.Close();              else RTL.Close(); }
-   double getTime(void)      { return (Type==LIME_SDR) ? Lms.getTime()      : RTL.getTime(); }
+   bool isOpen(void)
+   { if(Type==LIME_SDR) return Lms.isOpen();
+     if(Type==RSP_DUO)  return Rsp.isOpen();
+     return RTL.isOpen(); }
+
+   void Close(void)
+   { if(Type==LIME_SDR) Lms.Close();
+     else if(Type==RSP_DUO) Rsp.Close();
+     else RTL.Close(); }
+
+   double getTime(void)
+   { if(Type==LIME_SDR) return Lms.getTime();
+     if(Type==RSP_DUO)  return Rsp.getTime();
+     return RTL.getTime(); }
 
    int Open(uint32_t DeviceIndex=0, uint32_t Frequency=868000000, uint32_t SampleRate=2048000)
    { Close();
      this->DeviceIndex=DeviceIndex;
      if(Type==LIME_SDR) { Lms.FreqRaster=FreqRaster; return Lms.Open(DeviceIndex, Frequency, SampleRate); }
+     if(Type==RSP_DUO)  { Rsp.FreqRaster=FreqRaster; return Rsp.Open(DeviceIndex, Frequency, SampleRate); }
      RTL.FreqRaster=FreqRaster;
      return RTL.Open(DeviceIndex, Frequency, SampleRate); }
 
    int getDeviceIndexBySerial(const char *Serial)
-   { return (Type==LIME_SDR) ? Lms.getDeviceIndexBySerial(Serial) : RTL.getDeviceIndexBySerial(Serial); }
+   { if(Type==LIME_SDR) return Lms.getDeviceIndexBySerial(Serial);
+     if(Type==RSP_DUO)  return Rsp.getDeviceIndexBySerial(Serial);
+     return RTL.getDeviceIndexBySerial(Serial); }
 
    // -----------------------------------------------------------------------------------------------
    // Streaming
    // -----------------------------------------------------------------------------------------------
 
-   int ResetBuffer(void)                       { return (Type==LIME_SDR) ? Lms.ResetBuffer() : RTL.ResetBuffer(); }
-   int Read(uint8_t *Buffer, int Samples)      { return (Type==LIME_SDR) ? Lms.Read(Buffer,Samples) : RTL.Read(Buffer,Samples); }
+   int ResetBuffer(void)
+   { if(Type==LIME_SDR) return Lms.ResetBuffer();
+     if(Type==RSP_DUO)  return Rsp.ResetBuffer();
+     return RTL.ResetBuffer(); }
+
+   int Read(uint8_t *Buffer, int Samples)
+   { if(Type==LIME_SDR) return Lms.Read(Buffer,Samples);
+     if(Type==RSP_DUO)  return Rsp.Read(Buffer,Samples);
+     return RTL.Read(Buffer,Samples); }
+
    int Read(SampleBuffer<uint8_t> &Buffer, int Samples)
-   { return (Type==LIME_SDR) ? Lms.Read(Buffer,Samples) : RTL.Read(Buffer,Samples); }
+   { if(Type==LIME_SDR) return Lms.Read(Buffer,Samples);
+     if(Type==RSP_DUO)  return Rsp.Read(Buffer,Samples);
+     return RTL.Read(Buffer,Samples); }
 
    // -----------------------------------------------------------------------------------------------
    // Frequency
@@ -122,20 +171,40 @@ class SDR_Device
 
    int setCenterFreq(uint32_t Frequency)
    { if(Type==LIME_SDR) { Lms.FreqRaster=FreqRaster; return Lms.setCenterFreq(Frequency); }
+     if(Type==RSP_DUO)  { Rsp.FreqRaster=FreqRaster; return Rsp.setCenterFreq(Frequency); }
      RTL.FreqRaster=FreqRaster; return RTL.setCenterFreq(Frequency); }
 
-   uint32_t getCenterFreq(void)        { return (Type==LIME_SDR) ? Lms.getCenterFreq()      : RTL.getCenterFreq(); }
-   int setFreqCorrection(int PPM)      { return (Type==LIME_SDR) ? Lms.setFreqCorrection(PPM) : RTL.setFreqCorrection(PPM); }
-   int getFreqCorrection(void)         { return (Type==LIME_SDR) ? Lms.getFreqCorrection()  : RTL.getFreqCorrection(); }
+   uint32_t getCenterFreq(void)
+   { if(Type==LIME_SDR) return Lms.getCenterFreq();
+     if(Type==RSP_DUO)  return Rsp.getCenterFreq();
+     return RTL.getCenterFreq(); }
+
+   int setFreqCorrection(int PPM)
+   { if(Type==LIME_SDR) return Lms.setFreqCorrection(PPM);
+     if(Type==RSP_DUO)  return Rsp.setFreqCorrection(PPM);
+     return RTL.setFreqCorrection(PPM); }
+
+   int getFreqCorrection(void)
+   { if(Type==LIME_SDR) return Lms.getFreqCorrection();
+     if(Type==RSP_DUO)  return Rsp.getFreqCorrection();
+     return RTL.getFreqCorrection(); }
 
    // -----------------------------------------------------------------------------------------------
    // Sample rate
    // -----------------------------------------------------------------------------------------------
 
-   int setSampleRate(uint32_t SampleRate) { return (Type==LIME_SDR) ? Lms.setSampleRate(SampleRate) : RTL.setSampleRate(SampleRate); }
+   int setSampleRate(uint32_t SampleRate)
+   { if(Type==LIME_SDR) return Lms.setSampleRate(SampleRate);
+     if(Type==RSP_DUO)  return Rsp.setSampleRate(SampleRate);
+     return RTL.setSampleRate(SampleRate); }
 
-   // LimeSDR only: on-chip capture-and-decimate ratio. Ignored by an RTL-SDR, which has no
-   // equivalent (its sample rate is the tuner/converter rate).
+   uint32_t getSampleRate(void)
+   { if(Type==LIME_SDR) return Lms.getSampleRate();
+     if(Type==RSP_DUO)  return Rsp.getSampleRate();
+     return RTL.getSampleRate(); }
+
+   // LimeSDR only: on-chip capture-and-decimate ratio. The RSPduo has decimation of its own but
+   // it is driven from the sample rate, not from this knob, and an RTL-SDR has no equivalent.
    void setOversample(int Ratio)
    {
 #ifdef USE_LIMESDR
@@ -145,7 +214,7 @@ class SDR_Device
 #endif
    }
 
-   // LimeSDR only: reference clock selection. Ignored by an RTL-SDR, which has no such control.
+   // LimeSDR only: reference clock selection. Ignored by the other two radios.
    void setClockSource(const char *Name)
    {
 #ifdef USE_LIMESDR
@@ -183,48 +252,97 @@ class SDR_Device
 #endif
      return 0;
    }
-   uint32_t getSampleRate(void)           { return (Type==LIME_SDR) ? Lms.getSampleRate()          : RTL.getSampleRate(); }
 
    // -----------------------------------------------------------------------------------------------
    // Gain
    // -----------------------------------------------------------------------------------------------
 
-   int setTunerGainMode(int Manual)  { return (Type==LIME_SDR) ? Lms.setTunerGainMode(Manual) : RTL.setTunerGainMode(Manual); }
-   int setTunerGain(int Gain)        { return (Type==LIME_SDR) ? Lms.setTunerGain(Gain)       : RTL.setTunerGain(Gain); }
-   int getTunerGain(void)            { return (Type==LIME_SDR) ? Lms.getTunerGain()           : RTL.getTunerGain(); }
-   int getTunerGains(int *Gain=0)    { return (Type==LIME_SDR) ? Lms.getTunerGains(Gain)      : RTL.getTunerGains(Gain); }
+   int setTunerGainMode(int Manual)
+   { if(Type==LIME_SDR) return Lms.setTunerGainMode(Manual);
+     if(Type==RSP_DUO)  return Rsp.setTunerGainMode(Manual);
+     return RTL.setTunerGainMode(Manual); }
+
+   int setTunerGain(int Gain)
+   { if(Type==LIME_SDR) return Lms.setTunerGain(Gain);
+     if(Type==RSP_DUO)  return Rsp.setTunerGain(Gain);
+     return RTL.setTunerGain(Gain); }
+
+   int getTunerGain(void)
+   { if(Type==LIME_SDR) return Lms.getTunerGain();
+     if(Type==RSP_DUO)  return Rsp.getTunerGain();
+     return RTL.getTunerGain(); }
+
+   int getTunerGains(int *Gain=0)
+   { if(Type==LIME_SDR) return Lms.getTunerGains(Gain);
+     if(Type==RSP_DUO)  return Rsp.getTunerGains(Gain);
+     return RTL.getTunerGains(Gain); }
+
    int setTunerGainManual(int Manual=1) { return setTunerGainMode(Manual); }
    int setTunerGainAuto(void)           { return setTunerGainMode(0); }
 
    // -----------------------------------------------------------------------------------------------
-   // RTL-SDR specific options, accepted (and ignored) for LimeSDR
+   // Options that only some radios have; accepted (and ignored) by the others
    // -----------------------------------------------------------------------------------------------
 
-   int setOffsetTuning(int ON=1)     { return (Type==LIME_SDR) ? Lms.setOffsetTuning(ON) : RTL.setOffsetTuning(ON); }
-   int setBiasTee(int On=1)          { return (Type==LIME_SDR) ? Lms.setBiasTee(On)      : RTL.setBiasTee(On); }
+   int setOffsetTuning(int ON=1)
+   { if(Type==LIME_SDR) return Lms.setOffsetTuning(ON);
+     if(Type==RSP_DUO)  return Rsp.setOffsetTuning(ON);
+     return RTL.setOffsetTuning(ON); }
+
+   int setBiasTee(int On=1)
+   { if(Type==LIME_SDR) return Lms.setBiasTee(On);
+     if(Type==RSP_DUO)  return Rsp.setBiasTee(On);
+     return RTL.setBiasTee(On); }
+
+   // RSPduo only: sdrplay_api_RspDuoMode_Single_Tuner (default) or _Dual_Tuner. Takes effect at
+   // the next Open(), because the mode is fixed when the device is selected.
+   void setRspDuoMode(int Mode)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) Rsp.setRspDuoMode(Mode);
+#else
+     (void)Mode;
+#endif
+   }
 
    // -----------------------------------------------------------------------------------------------
    // Identification, for the status page and the log
    // -----------------------------------------------------------------------------------------------
 
-   const char *getDeviceName(void)   { return (Type==LIME_SDR) ? Lms.getDeviceName()      : RTL.getDeviceName(); }
-   const char *getTunerTypeName(void){ return (Type==LIME_SDR) ? Lms.getTunerTypeName()   : RTL.getTunerTypeName(); }
-   int getTunerType(void)            { return (Type==LIME_SDR) ? Lms.getTunerType()       : RTL.getTunerType(); }
+   const char *getDeviceName(void)
+   { if(Type==LIME_SDR) return Lms.getDeviceName();
+     if(Type==RSP_DUO)  return Rsp.getDeviceName();
+     return RTL.getDeviceName(); }
+
+   const char *getTunerTypeName(void)
+   { if(Type==LIME_SDR) return Lms.getTunerTypeName();
+     if(Type==RSP_DUO)  return Rsp.getTunerTypeName();
+     return RTL.getTunerTypeName(); }
+
+   int getTunerType(void)
+   { if(Type==LIME_SDR) return Lms.getTunerType();
+     if(Type==RSP_DUO)  return Rsp.getTunerType();
+     return RTL.getTunerType(); }
 
    int getUsbStrings(char *Manufacturer, char *Product, char *Serial)
-   { return (Type==LIME_SDR) ? Lms.getUsbStrings(Manufacturer,Product,Serial)
-                             : RTL.getUsbStrings(Manufacturer,Product,Serial); }
+   { if(Type==LIME_SDR) return Lms.getUsbStrings(Manufacturer,Product,Serial);
+     if(Type==RSP_DUO)  return Rsp.getUsbStrings(Manufacturer,Product,Serial);
+     return RTL.getUsbStrings(Manufacturer,Product,Serial); }
 
    int getXtalFreq(uint32_t &RtlFreq, uint32_t &TunerFreq)
-   { return (Type==LIME_SDR) ? Lms.getXtalFreq(RtlFreq,TunerFreq) : RTL.getXtalFreq(RtlFreq,TunerFreq); }
+   { if(Type==LIME_SDR) return Lms.getXtalFreq(RtlFreq,TunerFreq);
+     if(Type==RSP_DUO)  return Rsp.getXtalFreq(RtlFreq,TunerFreq);
+     return RTL.getXtalFreq(RtlFreq,TunerFreq); }
 
 #ifdef NEW_RTLSDR_LIB
    int getTunerStageGains(int Stage, int32_t *Gain, char *Description=0)
-   { return (Type==LIME_SDR) ? Lms.getTunerStageGains(Stage,Gain,Description)
-                             : RTL.getTunerStageGains(Stage,Gain,Description); }
+   { if(Type==LIME_SDR) return Lms.getTunerStageGains(Stage,Gain,Description);
+     return RTL.getTunerStageGains(Stage,Gain,Description); }
 
    int getTunerBandwidths(int *Bandwidth=0)
-   { return (Type==LIME_SDR) ? Lms.getTunerBandwidths(Bandwidth) : RTL.getTunerBandwidths(Bandwidth); }
+   { if(Type==LIME_SDR) return Lms.getTunerBandwidths(Bandwidth);
+     if(Type==RSP_DUO)  return 0;
+     return RTL.getTunerBandwidths(Bandwidth); }
 #endif
 
 } ;
