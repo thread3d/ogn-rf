@@ -448,15 +448,22 @@ class RSPDuo
    // the nearest, and lower rates are obtained with the API's on-chip decimation.
    // -----------------------------------------------------------------------------------------------
 
+   // Returns the ADC rate to program into fsFreq, and sets Decimation to the on-chip factor.
+   // The delivered output rate is the return value DIVIDED by Decimation - that division belongs
+   // to the caller, and only once.
+   //
+   // This distinction is load-bearing. The ADC cannot run below 2 MHz: asking for a lower fsFreq
+   // makes sdrplay_api_Init() fail outright, which is verified on hardware. So decimation is not
+   // an optimisation here, it is the only way to reach any rate below 2 MHz. Returning the already
+   // decimated rate would program a sub-2 MHz ADC rate (failing to start) and then divide a second
+   // time (halving the reported rate).
    static double SnapSampleRate(double Wanted, int &Decimation)
    { static const double Rate[3]={2000000.0, 6000000.0, 8000000.0};
      Decimation=1;
-     // Below 2 MHz: run the ADC at 2 MHz and decimate by a power of two.
-     if(Wanted<Rate[0]*1.5)
-     { Decimation=1;
+     if(Wanted<=Rate[0])
+     { // Largest power-of-two factor that still leaves at least the rate asked for.
        while( (Decimation<32) && (Wanted<=Rate[0]/(2.0*Decimation)) ) Decimation*=2;
-       if(Wanted>Rate[0]) return Rate[0];
-       return Rate[0]/(double)Decimation; }
+       return Rate[0]; }
      double Best=Rate[0]; double BestErr=fabs(Wanted-Rate[0]);
      for(int Idx=1; Idx<3; Idx++)
        if(fabs(Wanted-Rate[Idx])<BestErr) { Best=Rate[Idx]; BestErr=fabs(Wanted-Rate[Idx]); }
@@ -600,9 +607,11 @@ class RSPDuo
               1e-6*Rate/(double)Decimation); }
      else
      { Rate=SnapSampleRate((double)SampleRate, Decimation);
-       if((uint32_t)fabs(Rate-SampleRate)>1)
+       double Delivered=Rate/(double)(Decimation>1 ? Decimation : 1);
+       if((uint32_t)fabs(Delivered-SampleRate)>1)
          printf("RSPduo::Open() => %d Hz requested, the RSPduo gives %8.1f Hz%s\n",
-                SampleRate, Rate, Decimation>1 ? " (with on-chip decimation)" : "");
+                SampleRate, Delivered,
+                Decimation>1 ? " (2 MHz ADC decimated by 2 on chip)" : "");
        BwType=sdrplay_api_BW_1_536; IfType=sdrplay_api_IF_Zero; }
 
      Params->devParams->fsFreq.fsHz    = Rate;

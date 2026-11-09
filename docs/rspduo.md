@@ -122,6 +122,33 @@ A weak-signal capture can look misleading here: at 40 dB of gain the same band p
 which looks like a scale error but is simply a signal 24 dB below full scale. The quantisation check
 is the one that settles it; a peak alone does not.
 
+## Decimation
+
+The device decimates on chip, and it matters more than it sounds: **the ADC cannot run below
+2 MHz at all**. Ask for a lower `fsHz` and `sdrplay_api_Init()` fails outright — verified on
+hardware at 1 MHz and 500 kHz. So decimation is not an optimisation here, it is the *only* way to
+reach any rate below 2 MHz.
+
+`decimationFactor` accepts powers of two up to 32, measured by comparing the delivered rate against
+the ADC rate:
+
+| Factor | Delivered from a 2 MHz ADC | Measured |
+|---|---|---|
+| 1 | 2.000 MSps | 2.044 |
+| 2 | 1.000 MSps | 1.038 |
+| 4 | 0.500 MSps | 0.515 |
+| 8 | 0.250 MSps | 0.258 |
+| 16 | 0.125 MSps | 0.126 |
+| 32 | 0.0625 MSps | 0.063 |
+
+`SnapSampleRate()` returns the **ADC** rate to program, and the delivered rate is that divided by
+the factor — once, by the caller. Getting this wrong is easy and expensive: returning the
+already-decimated rate programs a sub-2 MHz ADC rate (which fails to start) and then divides a
+second time, halving the reported rate. A unit test pins the whole mapping down.
+
+Dual-tuner mode uses the same mechanism but the API chooses the factor itself, as part of the fixed
+combinations described above.
+
 ## Sample rate
 
 In single-tuner mode the RSPduo's ADC produces **2, 6 or 8 MHz** and nothing else. A requested rate
