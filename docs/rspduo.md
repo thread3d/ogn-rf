@@ -124,7 +124,7 @@ is the one that settles it; a peak alone does not.
 
 ## Decimation
 
-The device decimates on chip, and it matters more than it sounds: **the ADC cannot run below
+The API exposes a decimation factor, and it matters more than it sounds: **the ADC cannot run below
 2 MHz at all**. Ask for a lower `fsHz` and `sdrplay_api_Init()` fails outright — verified on
 hardware at 1 MHz and 500 kHz. So decimation is not an optimisation here, it is the *only* way to
 reach any rate below 2 MHz.
@@ -149,16 +149,20 @@ So the validity check is on range, not on form: anything up to 32 is accepted, o
 take effect, and 33 and above is rejected outright. `SnapSampleRate()` only ever produces powers of
 two, so the backend cannot fall into the silent case — but anything driving the API directly can.
 
-The full picture, measured by comparing the delivered rate against the ADC rate:
+**The decimation is not done on the RSPduo silicon.** That was an assumption in earlier revisions of
+this document and it is wrong; two independent measurements contradict it:
 
-| Factor | Delivered from a 2 MHz ADC | Measured |
-|---|---|---|
-| 1 | 2.000 MSps | 2.044 |
-| 2 | 1.000 MSps | 1.038 |
-| 4 | 0.500 MSps | 0.515 |
-| 8 | 0.250 MSps | 0.258 |
-| 16 | 0.125 MSps | 0.126 |
-| 32 | 0.0625 MSps | 0.063 |
+- The `sdrplay_apiService` daemon burns the *same* CPU at factor 1 and factor 32 — 0.61 s against
+  0.56 s over ten seconds, for 2.004 Msps against 0.063 Msps. If the chip decimated, the daemon
+  would be handling 32x fewer samples and its work would collapse. It doesn't move.
+- At an 8 MHz ADC with a factor of 32, the delivered rate is 168 ksps, not the 250 ksps the
+  arithmetic gives. The shortfall matches the bus-limited 5.48 Msps divided by 32 — so the stream is
+  limited at full rate *before* the factor is applied.
+
+The practical consequence matters on a shared bus: **decimation does not save USB bandwidth.** It
+reduces only the rate handed to the client, while the full-rate stream still crosses USB. It cannot
+be used to relieve bus contention, and it cannot recover the shortfall of an under-running ADC rate.
+A USB-level capture (`usbmon`, which needs root) would confirm this directly.
 
 `SnapSampleRate()` returns the **ADC** rate to program, and the delivered rate is that divided by
 the factor — once, by the caller. Getting this wrong is easy and expensive: returning the
@@ -176,7 +180,7 @@ silent 2 % rate error would slide every OGN channel off its FFT bin and quietly 
 
 ogn-rf's own default is 2048000 Hz (an RTL-SDR rate). For an RSPduo, configure
 `RF.SampleRate = 2000000`: that is the one rate at which both OGN channels fall where the frequency
-plan expects them. Rates below 2 MHz are reached with the API's on-chip decimation, which
+plan expects them. Rates below 2 MHz are reached with the API's decimation factor, which
 `SnapSampleRate()` sets up automatically.
 
 ## Gain

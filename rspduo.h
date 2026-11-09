@@ -445,10 +445,10 @@ class RSPDuo
    // Sample rate: snap to what the RSPduo can actually generate
    //
    // In single-tuner mode the RSPduo's ADC produces 2, 6 or 8 MHz. Anything else is snapped to
-   // the nearest, and lower rates are obtained with the API's on-chip decimation.
+   // the nearest, and lower rates are obtained with the API's decimation factor.
    // -----------------------------------------------------------------------------------------------
 
-   // Returns the ADC rate to program into fsFreq, and sets Decimation to the on-chip factor.
+   // Returns the ADC rate to program into fsFreq, and sets Decimation to the factor to request.
    // The delivered output rate is the return value DIVIDED by Decimation - that division belongs
    // to the caller, and only once.
    //
@@ -611,7 +611,7 @@ class RSPDuo
        if((uint32_t)fabs(Delivered-SampleRate)>1)
          printf("RSPduo::Open() => %d Hz requested, the RSPduo gives %8.1f Hz%s\n",
                 SampleRate, Delivered,
-                Decimation>1 ? " (2 MHz ADC decimated by 2 on chip)" : "");
+                Decimation>1 ? " (2 MHz ADC, decimation factor 2)" : "");
        BwType=sdrplay_api_BW_1_536; IfType=sdrplay_api_IF_Zero; }
 
      Params->devParams->fsFreq.fsHz    = Rate;
