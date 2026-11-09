@@ -96,6 +96,9 @@ class LimeSDR
 
    uint32_t      FreqRaster;        // [Hz] use only multiples of this base value to avoid tuning errors
 
+   int           Oversample;        // ADC-to-host rate ratio: 0 = driver decides, N = capture N x rate
+                                    // and decimate by N inside the LMS7002M before it reaches us
+
    uint32_t      Freq;              // [Hz] nominal (uncorrected) centre frequency
    int           FreqCorr;          // [ppm] software frequency correction
 
@@ -117,7 +120,7 @@ class LimeSDR
    LimeSDR()
    { DeviceIndex=0; DeviceSerial[0]=0; Device=0; Stream=0;
      Mtu=0; Scratch=0; Shift=8; ReadTimeoutUs=250000; MaxTimeouts=8;
-     Gains=0; FreqRaster=0; Freq=0; FreqCorr=0;
+     Gains=0; FreqRaster=0; Freq=0; FreqCorr=0; Oversample=0;
      GainMode=1; GaindB=0; BiasTee=(-1);
      Antenna=(-1); AntennaName[0][0]=0;
      BytesRead=0; SamplePeriod=1e-6; }
@@ -185,7 +188,21 @@ class LimeSDR
 
      try
      {
-       // Sample rate first: the analogue filter and the calibration depend on it
+       // Oversampling decides how the LMS7002M reaches the rate asked for below: with a ratio of
+       // N the converter runs at N x the host rate and the on-chip CIC/FIR chain decimates by N.
+       // It has to be in place BEFORE setSampleRate(), which configures the chain.
+       //
+       // Measured on this board it changes nothing for OGN at 868 MHz: the receiver there is
+       // limited by antenna noise, not by converter resolution, so decimating cannot manufacture
+       // SNR that the antenna is not delivering (the in-band noise density with and without it
+       // agrees to ~0.1 dB). It is exposed because it is the right knob where the analogue noise
+       // is low enough that the converter floor matters, and because a sharper on-chip
+       // decimation filter helps when a strong signal sits just outside the passband.
+       if(Oversample>0)
+       { try { Device->writeSetting("OVERSAMPLING", std::to_string(Oversample)); }
+         catch(const std::exception &Ex) { printf("LimeSDR::Open() => OVERSAMPLING=%d rejected: %s\n", Oversample, Ex.what()); } }
+
+       // Sample rate next: the analogue filter and the calibration depend on it
        Device->setSampleRate(SOAPY_SDR_RX, Channel, (double)SampleRate);
        double ActualRate=Device->getSampleRate(SOAPY_SDR_RX, Channel);
        if(fabs(ActualRate-SampleRate)>0.5)

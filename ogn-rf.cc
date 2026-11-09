@@ -85,6 +85,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
    FreqPlan         HoppingPlan;                // frequency hopping plan (depends on the world region)
 
    int  DeviceType;                             // 0=RTL-SDR, 1=LimeSDR, see sdr.h
+   int  Oversample;                             // [LimeSDR] on-chip decimation ratio, 0 = driver decides
    int  DeviceIndex;                            // rtl-sdr device index
    char DeviceSerial[64];                       // serial number of the rtl-sdr device to be selected
    int  OffsetTuning;                           // [bool] this option might be good for E4000 tuner
@@ -148,7 +149,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     OGN_GainMode=1; OGN_Gain=600;
     HoppingPlan.setPlan(0);
     PulseFilt.Threshold=0;
-    DeviceType=SDR_Device::RTL_SDR; DeviceIndex=0; DeviceSerial[0]=0;
+    DeviceType=SDR_Device::RTL_SDR; DeviceIndex=0; DeviceSerial[0]=0; Oversample=0;
     OffsetTuning=0; FreqCorr=0; FreqRaster=28125; BiasTee=(-1);
     // GSM_CenterFreq=GSM_LowEdge+GSM_ScanStep/2; GSM_Scan=1; GSM_SamplesPerRead=(250*SampleRate)/1000; GSM_Gain=200;
     GSM_CenterFreq=0; GSM_Scan=0; GSM_Gain=200;
@@ -170,6 +171,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     config_lookup_float_or_int(Config,   "RF.FreqCorr", &Corr); FreqCorr = (int)floor(Corr+0.5);
     config_lookup_int(Config,   "RF.FreqRaster",     &FreqRaster);
     config_lookup_int(Config,   "RF.Device",         &DeviceIndex);
+    config_lookup_int(Config,   "RF.Oversample",     &Oversample);   // LimeSDR: capture N x rate, decimate on chip
     const char *DeviceTypeName = 0;                                     // RF.DeviceType = "rtlsdr" or "limesdr"
     if(config_lookup_string(Config,"RF.DeviceType", &DeviceTypeName)==CONFIG_TRUE)
       DeviceType=SDR_Device::getTypeByString(DeviceTypeName);
@@ -335,6 +337,7 @@ Content-Disposition: attachment; filename=\"%s_%07.3fMHz_%03.1fMsps_%10dsec.jpg\
        }
        else                                                                // if not open yet or was closed due to an error
        { SDR.setType(DeviceType);                                          // RTL-SDR dongle or LimeSDR
+         SDR.setOversample(Oversample);                                    // must precede Open()
          int Index=(-1);
          if(DeviceSerial[0]) Index=SDR.getDeviceIndexBySerial(DeviceSerial);
          if(Index<0) Index=DeviceIndex;
@@ -1014,6 +1017,8 @@ Refresh: 5\r\n\
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.Enable</td><td align=right><b>%d</b></td></tr>\n",                  FFT->Filter->Enable);
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.FFTsize</td><td align=right><b>%d</b></td></tr>\n",                 FFT->Filter->FFTsize);
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.Threshold</td><td align=right><b>%3.1f</b></td></tr>\n",            FFT->Filter->Threshold);
+     if(RF->SDR.HaveLimeSDR())
+       dprintf(Client->SocketFile, "<tr><td>RF.Oversample</td><td align=right><b>%d%s</b></td></tr>\n",                RF->Oversample, RF->Oversample?"":" (auto)");
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.GainMode</td><td align=right><b>%d</b></td></tr>\n",                 RF->OGN_GainMode);
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.Gain</td><td align=right><b>%4.1f dB</b></td></tr>\n",           0.1*RF->OGN_Gain);
      // dprintf(Client->SocketFile, "<tr><td>RF.OGN.CenterFreq</td><td align=right><b>%5.1f MHz</b></td></tr>\n",   1e-6*RF->OGN_CenterFreq);

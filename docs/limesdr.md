@@ -58,7 +58,8 @@ RF = {
   OfsTune      = 0;
   FreqCorr     = 0;
   SampleRate   = 1000000;
-  OGN = { Gain = 50.0; GainMode = 1; SampleRate = 1000000;
+  Oversample   = 0;              // on-chip capture/decimate ratio; 0 = driver decides
+  OGN = { Gain = 61.0; GainMode = 1; SampleRate = 1000000;
           SensTime = 0.85; StartTime = 0.375; };
 };
 Position = { Latitude = 51.5; Longitude = -0.1; };
@@ -67,7 +68,10 @@ HTTP = { Port = 8095; };
 ```
 
 `RF.OGN.Gain` is in **dB** (SoapySDR's own units), not an RTL-SDR tuner's discrete steps. The board
-offers −12 … +61 dB.
+offers −12 … +61 dB, and **61 dB is the right value**, measured: at 50 dB the noise floor sits
+0.7 dB above the receiver's own converter floor (it is listening to itself), at 61 dB ~9 dB above
+it. That is too much gain for a busy band — at 800 MHz the ADC is already at 92 % of full scale —
+but OGN's hopping plan only spans 868.2–868.4 MHz, which is quiet.
 
 Startup:
 
@@ -94,6 +98,14 @@ discrete tuner gain table. `MTU=2040` is what SoapyLMS7 negotiates; a 0.85 s slo
 | bias tee | accepted and ignored — a LimeSDR-USB has none |
 | offset tuning | accepted and ignored — an RTL-SDR/E4000 concept |
 
+`RF.Oversample` maps to SoapyLMS7's `OVERSAMPLING` setting: with a ratio of N the LMS7002M runs its
+converter at N × the host rate and decimates on chip, so `ogn-rf` still receives 1 MSps. It is
+implemented and wired up, but **it measures as neutral for OGN here** — a native 1 MSps capture and
+a 4 MSps capture normalise to the same in-band noise density (−88.1 vs −88.9 dBFS/Hz), and
+`OVERSAMPLING` 0/2/8/16 all land within 0.1 dB of each other, because at 868 MHz with an antenna the
+receiver is limited by sky noise rather than converter resolution. It is the right knob where that
+is not true (short antenna, low gain, the HF bands) and is left at 0 in the shipped configuration.
+
 Two of those are load-bearing:
 
 **`ResetBuffer()` must not re-calibrate.** The obvious implementation, deactivate/re-activate the
@@ -113,12 +125,12 @@ it leaves a second radio (Airspy, bladeRF, …) behind the same `sdr.h` switch f
 
 ## What is not proven
 
-- **Over-the-air OGN decoding.** The LimeSDR on this setup has **no RF input connected**: every LNA
-  path, and a sweep across 100/433/868/915 MHz, measure an identical receiver noise floor — at
-  100 MHz an attached antenna would show broadcast FM at enormous amplitude. So the chain is
-  verified up to "correct samples, on time, no clipping", and not beyond. Attach an antenna to
-  `RX1_L` and the receiver should decode; `scripts/verify-reception.sh` in the companion repository
-  says within a minute whether signal is arriving.
+- **Over-the-air OGN decoding.** Not demonstrated, because there is nothing to demodulate: an
+  868 MHz omni antenna is connected to `RX1_L` and the front end is provably live — the noise floor
+  is 17–20 dB higher at 780/800 MHz (DVB-T2, LTE800) than at 868 MHz, which an unconnected port
+  cannot do — but both OGN channels measure at the noise floor (+0.4 dB, +0.3 dB). No transmitter is
+  in range at this location yet. `scripts/verify-reception.sh` in the companion repository says
+  within a minute whether signal has appeared.
 - **GSM frequency calibration.** The retune calls are implemented, but with no RF there has never
   been a burst to lock to.
 - **RX1 channel.** Only `RX0` is used. Using both channels coherently is not implemented.

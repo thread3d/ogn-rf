@@ -133,6 +133,17 @@ class SDR_Device
    // -----------------------------------------------------------------------------------------------
 
    int setSampleRate(uint32_t SampleRate) { return (Type==LIME_SDR) ? Lms.setSampleRate(SampleRate) : RTL.setSampleRate(SampleRate); }
+
+   // LimeSDR only: on-chip capture-and-decimate ratio. Ignored by an RTL-SDR, which has no
+   // equivalent (its sample rate is the tuner/converter rate).
+   void setOversample(int Ratio)
+   {
+#ifdef USE_LIMESDR
+     if(Type==LIME_SDR) Lms.Oversample=Ratio;
+#else
+     (void)Ratio;
+#endif
+   }
    uint32_t getSampleRate(void)           { return (Type==LIME_SDR) ? Lms.getSampleRate()          : RTL.getSampleRate(); }
 
    // -----------------------------------------------------------------------------------------------
