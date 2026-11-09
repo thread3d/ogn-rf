@@ -149,20 +149,35 @@ So the validity check is on range, not on form: anything up to 32 is accepted, o
 take effect, and 33 and above is rejected outright. `SnapSampleRate()` only ever produces powers of
 two, so the backend cannot fall into the silent case — but anything driving the API directly can.
 
-**The decimation is not done on the RSPduo silicon.** That was an assumption in earlier revisions of
-this document and it is wrong; two independent measurements contradict it:
+**Where the decimation physically happens is not settled, and earlier revisions of this document
+claimed both answers.** What is actually known:
 
-- The `sdrplay_apiService` daemon burns the *same* CPU at factor 1 and factor 32 — 0.61 s against
-  0.56 s over ten seconds, for 2.004 Msps against 0.063 Msps. If the chip decimated, the daemon
-  would be handling 32x fewer samples and its work would collapse. It doesn't move.
-- At an 8 MHz ADC with a factor of 32, the delivered rate is 168 ksps, not the 250 ksps the
-  arithmetic gives. The shortfall matches the bus-limited 5.48 Msps divided by 32 — so the stream is
-  limited at full rate *before* the factor is applied.
+*Evidence that it is programmed into silicon* — the vendor daemon carries register-level controls
+named `decimateControl`, `DecimateOutScale` and `DecimateRound[0]`/`[1]` (the last two logged as
+32-bit hex register values), alongside GPIO and tuner-channel register calls such as
+`GpioDualExtWrite()` and `rspDuoTunerChannelConfig`. A daemon that only writes registers would
+point at a hardware decimator.
 
-The practical consequence matters on a shared bus: **decimation does not save USB bandwidth.** It
-reduces only the rate handed to the client, while the full-rate stream still crosses USB. It cannot
-be used to relieve bus contention, and it cannot recover the shortfall of an under-running ADC rate.
-A USB-level capture (`usbmon`, which needs root) would confirm this directly.
+*Evidence that points the other way* —
+
+- The daemon's CPU barely moves between factor 1 and factor 32: 0.61 s against 0.56 s over ten
+  seconds, for 2.004 Msps against 0.063 Msps. If the chip decimated, it would be handling 32x fewer
+  samples. (Weak on its own: the daemon runs at ~7 % of a core, so it is I/O-bound and fixed
+  overhead could dominate.)
+- At an 8 MHz ADC with a factor of 32 the delivered rate is 168 ksps, not the 250 ksps the
+  arithmetic gives — exactly the bus-limited 5.48 Msps divided by 32. That looks like a limit applied
+  at full rate *before* the factor.
+- The daemon is **not** free of host DSP: it contains 2541 NEON-register operands and 67 vector
+  instructions, so a software decimator would not be out of place in it. (An earlier revision of
+  this document claimed "zero SIMD"; that was a bad grep and it was wrong.)
+
+What would settle it is a USB-level capture — `modprobe usbmon` then `tcpdump -i usbmon0` — showing
+whether 32x decimation drops the traffic from 8 MB/s to 0.25 MB/s. That needs root and has not been
+done. Until it is, treat "decimation does not save USB bandwidth" as **unverified**, not as fact.
+
+What remains solid regardless of where it runs: the factor is 1, 2, 4, 8, 16 or 32 and nothing else,
+only powers of two take effect (others are silently ignored), 33 and above fail `Init()`, and a
+factor applies to whatever the ADC is delivering.
 
 `SnapSampleRate()` returns the **ADC** rate to program, and the delivered rate is that divided by
 the factor — once, by the caller. Getting this wrong is easy and expensive: returning the
