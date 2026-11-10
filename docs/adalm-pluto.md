@@ -96,27 +96,39 @@ than derived. Too small a shift and the OGN pulses fold at the peaks; too large 
 noise costs the weak ones. The right value here is to be found by injecting a known level and
 sweeping gain with `pluto_probe`, and written down where the constant is defined.
 
-### 3. The chip cannot go where ogn-rf wants to go
+### 3. The chip decimates on-chip already, and USB is the ceiling
 
-This is the constraint that decides the architecture of the backend, and it is not negotiable
-software-wise. The AD9361/AD9363 family's decimating filters bottom out at roughly **2.08 MSPS**,
-while `ogn-rf` asks for 1.0 MSPS by default (`ogn-rf.cc`) and 2.048 MSPS by inheritance from the
-RTL-SDR (`rtlsdr.h`, `sdr.h`). Both are below the floor.
+The constraint that decides the backend's architecture, now measured rather than reasoned about.
 
-`sdr.h` already has the hook for this — `setOversample(Ratio)`, added for the RSPduo's fixed 2/6/8
-MSPS ADC. The Pluto wants the same treatment:
+`ogn-rf` asks for 1.0 MSPS by default (`ogn-rf.cc`) and 2.048 MSPS by inheritance from the RTL-SDR
+(`rtlsdr.h`, `sdr.h`). The chip's floor is **2 083 333 Hz**, so both are unreachable — and so is
+2.000 MSPS. One software step is therefore unavoidable to land on exactly 2.0.
 
-| ogn-rf asks for | chip runs at | software decimation | USB traffic | note |
-|---|---|---|---|---|
-| 2 000 000 | 4 000 000 | ÷2 | 16 MB/s | **intended default** — exact integer ratio, a quarter of USB2 |
-| 2 000 000 | 8 000 000 | ÷4 | 32 MB/s | if the ÷2 decimation turns out to alias |
-| 1 000 000 | 8 000 000 | ÷8 | 32 MB/s | only if 1 Msps is genuinely wanted |
-| 2 083 333 | 2 083 333 | ÷1 | 8 MB/s | ask ogn-rf to match the chip; least USB load, but the rate is unrelated to the OGN clock |
+What is worth stating plainly, because the opposite is easy to assume: **the chip decimates on every
+setting, and a higher sample rate does not put more work on it.** `rx_path_rates` shows the chain: at
+4 MSPS the ADC runs at 32 MHz and the filters are ÷8; at 61.44 MSPS the ADC runs at 491.52 MHz with
+the *same* ÷8. Only the minimum data rate gets the extra ÷12. And **USB saturates near 8 MSPS /
+31 MB/s** — requests for 15.36, 30.72 and 61.44 MSPS all delivered about 8 Msps and 31 MB/s, so the
+link, not the chip, is what limits a high rate.
 
-The first row is the recommendation, for a reason beyond arithmetic: 2.0 MSPS is **the same rate the
-`rspduo` branch settled on**, so the frequency plan and the gain measurements from that work stay
-directly comparable. The decimation itself is a two-tap box filter and `boxfilter.h` is already in
-the tree.
+| Chip data rate | On-chip | Software | Into ogn-rf | USB | Verdict |
+|---|---|---|---|---|---|
+| 2 083 333 | **÷12** | none, but the rate is 2.0833 | 2 083 333 | 8 MB/s | `SpectrogramFFTsize` becomes 1066; every rate-dependent constant shifts 4 % |
+| **4 000 000** | ÷8 | **÷2 box** | **2 000 000** | **15 MB/s** | **the choice** — exact rate, 4x USB headroom |
+| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | at the USB ceiling for no gain |
+| 61 440 000 | ÷8 | ÷32 box | 2 000 000 | impossible | the link delivers 8 MSPS |
+
+`sdr.h` already has the hook — `setOversample(Ratio)`, added for the RSPduo's fixed 2/6/8 MSPS ADC —
+and 4 MSPS ÷ 2 is exactly what it was for.
+
+The tie-breaker is arithmetic that is not arbitrary: **8 x 2 000 000 / 15 625 = 1024 exactly**, so
+ogn-rf's spectrogram is the power-of-two FFT its author wrote it against. At 2 083 333 the same
+expression gives 1066. And 2.0 MSPS is the rate the `rspduo` branch already settled on, so the
+frequency plan and gain measurements from that work stay comparable.
+
+Validated on hardware: `-r 4000000 -D 2` produced 1 000 000 samples at exactly 2 000 000 Hz, rms
+0.7 %FS against 0.8 %FS undecimated — the ~1/√2 a box filter over independent noise should give —
+crest 5.02, nothing clipped. The filter is the same shape as ogn-rf's own `boxfilter.h`.
 
 ## The attribute map
 
