@@ -6,17 +6,16 @@ hardware bring-up log live in the companion repository
 [`thread3d/ADALM-Pluto`](https://github.com/thread3d/ADALM-Pluto); this file is the part that belongs
 next to the code.
 
-**Status: design only. No backend is in this branch yet, and nothing has been received.**
+**Status: the radio works and its numbers are measured; the backend is still to be written.**
 
-That is a deliberate choice rather than an accident of time. The radio currently falls off the USB
-bus four seconds after it enumerates, so every number that would decide the shape of the backend —
-the chip's real rate floor, the gain range, the working conversion scale — is unread. A backend
-written now would be a set of guesses wearing a `.h` extension, and the pattern from the other device
-branches is that the expensive part is not writing the code, it is discovering which guess was wrong.
-The companion repository's `docs/status-log.md` records exactly what is known and what is blocked.
+As of 2026-11-10 the ADALM-PLUTO on `xavieragx.local` receives: it opens through libiio over USB,
+tunes, captures 12-bit I/Q at 4 MSPS, and reads FM broadcast at 100 MHz **+23 dB** above the noise
+floor it sees on the 868.4 MHz OGN channel. Everything this design was waiting on is now measured
+rather than inferred — the rate floor, the gain range, the sample format and the frequency trim.
 
-When the link is stable, `plutosdr.h` goes in and this branch changes from a document into a
-backend. Until then, this file is the contract it will have to meet.
+Two things still keep `plutosdr.h` out of this branch: the backend should be written once against
+those measurements rather than as another draft, and the one remaining unknown that changes code —
+how ogn-rf's own DSP behaves at the decimated rate — cannot be answered until the backend exists.
 
 ## How it fits in
 
@@ -132,10 +131,10 @@ answer all of them or the branch does not link.
 | `Read(uint8_t*, Samples)` | `iio_buffer_refill()`, then convert 12-bit to 8-bit unsigned — see above |
 | `ResetBuffer()` | refill and discard until empty, so a retune does not hand over stale data |
 | `setCenterFreq()` / `getCenterFreq()` | `altvoltage0` → `frequency` on `ad9361-phy` |
-| `setSampleRate()` / `getSampleRate()` | `voltage0` → `sampling_frequency` |
-| `setFreqCorrection()` / `getFreqCorrection()` | no ppm register: applied as an offset on the LO |
+| `setSampleRate()` / `getSampleRate()` | `voltage0` → `sampling_frequency`; the floor is **2 083 333 Hz** and the value to request is 2 083 334 |
+| `setFreqCorrection()` / `getFreqCorrection()` | device attribute `xo_correction` — a **real** trim, measured ±200 ppm at 1 Hz resolution on a 40 MHz XO (`xo = 40e6 + 40 x ppm`) |
 | `setTunerGain()`, `getTunerGain()`, `getTunerGains()` | `voltage0` → `hardwaregain`, with `gain_control_mode` = `manual` |
-| `setTunerGainMode()` | device attribute `gain_control_mode` (`manual`, `slow_attack`, `fast_attack`) |
+| `setTunerGainMode()` | `gain_control_mode` — **a channel attribute of `voltage0` (input)**, not a device attribute; values `manual fast_attack slow_attack hybrid` |
 | `setOversample()` | chip rate = `Ratio ×` requested rate — the core of the rate design above |
 | `getTime()` | `clock_gettime()`, unchanged from `rtlsdr.h` |
 | `getTunerType()`, `getDeviceName()`, `getUsbStrings()` | from the context and the device's own strings; the status page prints these |
@@ -149,9 +148,10 @@ that is silently ignored is worse than one that is rejected:
 - **`BiasTee`** — accepted and ignored. There is no bias tee: a Pluto is a transceiver on a bare
   board, with no antenna switch and no LNA supply.
 - **`OfsTune`** — accepted and ignored. There is no offset-tuning mode.
-- **`FreqCorr`** — a real correction, but not the RSPduo's kind. The AD9363 has no ppm register, so
-  the value is applied as an arithmetic offset on the LO. It is honest, but it is ours, not the
-  chip's, and it should be measured with `gsm_scan` before it is trusted.
+- **`FreqCorr`** — a real hardware correction. An earlier version of this document said the AD9363
+  has no ppm register; that was wrong. `xo_correction` is a device attribute, measured at
+  39 999 890 Hz with a range of 39 991 891 to 40 007 889 Hz: ±200 ppm at 1 Hz (0.025 ppm)
+  resolution on the 40 MHz XO.
 - **`FreqRaster`** — worth setting to 1 (no rounding). The AD9363 tunes to well under 1 Hz.
 
 ## Building it on this board
@@ -175,35 +175,37 @@ make USE_PLUTOSDR=1 \
      LIBS="-L$P/lib -Wl,-rpath,$P/lib -lpthread -lm -ljpeg -lconfig -lrt"
 ```
 
-## What has to be settled on hardware
+## What hardware has already settled
 
-In order of how much they change the design:
+| Question | Answer | Effect on the design |
+|---|---|---|
+| Rate floor | `[2083333 1 61440000]`; 2083333 rejected, 2083334 applied as 2 083 333; 1.0 and 2.048 MSPS rejected; 4.0 MSPS → 3 999 999 | decimation is mandatory, and 4 MSPS ÷ 2 = 2.0 MSPS is the shape |
+| Gain | `[-1 1 73]`, 1 dB steps, and **not** linear in dB; nothing clips at 73 dB on a quiet band | use the measured table, not a formula; the shipped config asks for 73 |
+| Format | 12-bit signed, shift 0 | shift by 4 for 8-bit, then calibrate |
+| USB face | interface 5 is IIO and opens reliably through libusb; `rndis_host`/`cdc_acm` are not loaded, so the network gadget is not an option | USB transport, and a `usb:` context found **by serial** because the address in the URI changes on every replug |
+| Attribution | `gain_control_mode` and `hardwaregain` are channel attributes; `xo_correction`/`ensm_mode` are device attributes | write to the channel, or fail silently |
 
-1. **The real rate floor** — `sampling_frequency_available` on `voltage0`. If it permits 2.0 MSPS
-   directly, the decimation design collapses into a pass-through and the backend gets simpler.
-2. **The conversion scale** — sweep gain against RMS and crest factor, and pick the shift that keeps
-   the noise floor near 20-25 % of full scale with a crest factor around 9-11.
-3. **The gain law** — the RSPduo's turned out to be `total = 115.8 − gRdB`; this one has to be
-   measured the same way before any dB figure in a config file means anything.
-4. **Which USB face the firmware offers**, and whether USB or the network gadget is the better
-   transport for a one-second burst every thirty seconds. USB avoids depending on a DHCP lease.
-5. **`ResetBuffer()` semantics** — libiio is a blocking read, which is closer to the RTL-SDR model
-   than the RSPduo's callback API, but how much stale data a refill can deliver after a retune is
-   precisely what produces a "Half time slot" warning when it is wrong.
+## What is still open
 
-## Why there is no backend in this branch yet
+1. **ogn-rf's DSP at the decimated rate** — `SpectrogramFFTsize=(8*SampleRate)/15625` is not a power
+   of two at 2.0 or 2.083 MSPS, and has never been exercised. Most likely to need a change here
+   rather than in the backend.
+2. **The 8-bit conversion shift** — a calibration against a known level, as the `rspduo` branch had to
+   do when it settled on a shift of 8.
+3. **`ResetBuffer()` after a retune** — how much stale data a libiio refill can hand over, which is
+   what turns into a "Half time slot" warning when it is wrong.
+4. **Sustained throughput** — 0.5 s at 4 MSPS (16 MB) is fine; a whole `SensTime` window every
+   30 seconds over 480 Mbit/s behind two hubs is untested.
 
-Because the radio does not stay on the bus. The Pluto enumerated once on 2026-11-10 at 10:44:55 as
-`0456:B673`, presented its firmware volume as mass storage, reported `Power-on or device reset
-occurred`, and disconnected at 10:44:59. Until that is fixed — the leading suspect is a brown-out,
-since the device is bus-powered and sits behind three hubs — items 1, 2, 3 and 5 above are unreadable,
-and each of them changes code.
+## Why the backend is not in this branch yet
 
-What exists instead: the companion repository holds a read-only link diagnosis
-(`scripts/probe-pluto.sh`), a libiio receive checker that compiles and behaves correctly against this
-board's libiio 0.19 (`src/pluto_probe.c`), the udev rule for non-root access, and a configuration
-whose every value either has a reason or is marked as unmeasured.
+Not for want of a radio. The measurements above are the ones that decide its shape, and they arrived
+late; writing `plutosdr.h` now means writing it once, against real numbers, instead of the four
+drafts this document went through while the answers kept moving. That is the whole reason the branch
+has a design document and no code.
+
+The repository that produced the measurements is [`thread3d/ADALM-Pluto`](https://github.com/thread3d/ADALM-Pluto):
+`scripts/probe-pluto.sh`, `src/pluto_probe.c` and `docs/hardware.md` hold the tooling and the tables.
 
 ## Licence
-
 `ogn-rf` is **GPL v3**. `plutosdr.h` will be part of it and carries the same licence.
