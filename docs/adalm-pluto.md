@@ -111,24 +111,35 @@ the *same* ÷8. Only the minimum data rate gets the extra ÷12. And **USB satura
 31 MB/s** — requests for 15.36, 30.72 and 61.44 MSPS all delivered about 8 Msps and 31 MB/s, so the
 link, not the chip, is what limits a high rate.
 
-| Chip data rate | On-chip | Software | Into ogn-rf | USB | Verdict |
+| Chip data rate | On-chip | Software | Into ogn-rf | USB | Measured |
 |---|---|---|---|---|---|
-| 2 083 333 | **÷12** | none, but the rate is 2.0833 | 2 083 333 | 8 MB/s | `SpectrogramFFTsize` becomes 1066; every rate-dependent constant shifts 4 % |
-| **4 000 000** | ÷8 | **÷2 box** | **2 000 000** | **15 MB/s** | **the choice** — exact rate, 4x USB headroom |
-| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | at the USB ceiling for no gain |
-| 61 440 000 | ÷8 | ÷32 box | 2 000 000 | impossible | the link delivers 8 MSPS |
+| 2 083 333 | **÷12** | none, but the rate is 2.0833 | 2 083 333 | 8 MB/s | `SpectrogramFFTsize` becomes 1066 |
+| 4 000 000 | ÷8 | ÷2 box | 2 000 000 | 15 MB/s | 98.4 % delivered, +33 ms — clean |
+| **6 000 000** | ÷8 | **÷3 box** | **2 000 000** | **23 MB/s** | **99.4 % delivered, +12 ms — clean, and the best of them** |
+| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | 95.8 % — **loses ~4 % of samples** |
+| 10 000 000 | ÷8 | ÷5 box | 2 000 000 | over capacity | 78 % — real output collapses to 1.56 MSPS |
+| 16 000 000 | ÷8 | ÷8 box | 2 000 000 | impossible | 49 % — real output collapses to 0.97 MSPS |
+
+**6 MSPS ÷ 3 is the highest decimation that still delivers exactly 2.0 MSPS**, and it won on every
+criterion — reproducible across three repeats, at 99.4 % delivered with 10-12 ms of buffering
+overhead and no lost samples. The lesson generalises: above what the link can carry, asking for more
+makes the receiver *slower*, because the device drops samples and the decimated rate falls below 2.0.
 
 `sdr.h` already has the hook — `setOversample(Ratio)`, added for the RSPduo's fixed 2/6/8 MSPS ADC —
-and 4 MSPS ÷ 2 is exactly what it was for.
+and this is precisely what it was for: `setOversample(3)` at a 6 MSPS chip rate.
+
+One caveat the backend should keep: the ~31 MB/s link is shared with any other SDR on the board.
+6 MSPS ÷ 3 uses 23 MB/s of it; 4 MSPS ÷ 2 uses 15 MB/s for the same 2.0 MSPS output. If the RSPduo or
+the LimeSDR stream concurrently, prefer 4 ÷ 2.
 
 The tie-breaker is arithmetic that is not arbitrary: **8 x 2 000 000 / 15 625 = 1024 exactly**, so
 ogn-rf's spectrogram is the power-of-two FFT its author wrote it against. At 2 083 333 the same
 expression gives 1066. And 2.0 MSPS is the rate the `rspduo` branch already settled on, so the
 frequency plan and gain measurements from that work stay comparable.
 
-Validated on hardware: `-r 4000000 -D 2` produced 1 000 000 samples at exactly 2 000 000 Hz, rms
-0.7 %FS against 0.8 %FS undecimated — the ~1/√2 a box filter over independent noise should give —
-crest 5.02, nothing clipped. The filter is the same shape as ogn-rf's own `boxfilter.h`.
+Validated on hardware: `-r 6000000 -D 3 -n 12000000` produced 4 000 000 samples at a nominal
+2 000 000 Hz over 2.000 s, 99.5 % delivered, rms 0.6 %FS, crest 5.33, nothing clipped. The filter is
+the same shape as ogn-rf's own `boxfilter.h`.
 
 ## The attribute map
 
