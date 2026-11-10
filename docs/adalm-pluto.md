@@ -111,26 +111,30 @@ the *same* ÷8. Only the minimum data rate gets the extra ÷12. And **USB satura
 31 MB/s** — requests for 15.36, 30.72 and 61.44 MSPS all delivered about 8 Msps and 31 MB/s, so the
 link, not the chip, is what limits a high rate.
 
-| Chip data rate | On-chip | Software | Into ogn-rf | USB | Measured |
+| Chip data rate | On-chip | Software | Into ogn-rf | USB | Measured (3 repeats, >=2 s) |
 |---|---|---|---|---|---|
-| 2 083 333 | **÷12** | none, but the rate is 2.0833 | 2 083 333 | 8 MB/s | `SpectrogramFFTsize` becomes 1066 |
-| 4 000 000 | ÷8 | ÷2 box | 2 000 000 | 15 MB/s | 98.4 % delivered, +33 ms — clean |
-| **6 000 000** | ÷8 | **÷3 box** | **2 000 000** | **23 MB/s** | **99.4 % delivered, +12 ms — clean, and the best of them** |
-| 8 000 000 | ÷8 | ÷4 box | 2 000 000 | 31 MB/s | 95.8 % — **loses ~4 % of samples** |
-| 10 000 000 | ÷8 | ÷5 box | 2 000 000 | over capacity | 78 % — real output collapses to 1.56 MSPS |
-| 16 000 000 | ÷8 | ÷8 box | 2 000 000 | impossible | 49 % — real output collapses to 0.97 MSPS |
+| **2 083 334** | **÷12** | **none** | **2 081 065** | **8.3 MB/s** | **99.8-99.9 %, +2-4 ms — clean** |
+| 4 000 000 | ÷8 | ÷2 box | 1 997 777 | 15.0 MB/s | 99.9 %, +2-3 ms — clean |
+| 6 000 000 | ÷8 | ÷3 box | 1 997 986 | 23.0 MB/s | 99.9 %, +2-3 ms — clean |
+| 8 000 000 | ÷8 | ÷4 box | ~1 950 000 | 31.0 MB/s | 95.2-95.6 % — **drops 2-5 % of samples** |
+| 10 000 000 | ÷8 | ÷5 box | 1 580 000 | over capacity | 78.8 % — real output collapses |
+| 16 000 000 | ÷8 | ÷8 box | 990 000 | over capacity | 49.5 % — real output collapses |
 
-**6 MSPS ÷ 3 is the highest decimation that still delivers exactly 2.0 MSPS**, and it won on every
-criterion — reproducible across three repeats, at 99.4 % delivered with 10-12 ms of buffering
-overhead and no lost samples. The lesson generalises: above what the link can carry, asking for more
-makes the receiver *slower*, because the device drops samples and the decimated rate falls below 2.0.
+The three clean rows are indistinguishable on delivery, so the choice is not about throughput at all —
+it is about **where the last factor happens**. Having the chip do all of it (`2 083 334` / ÷1) puts
+2.081 MSPS on the wire from 8.3 MB/s and asks nothing of the host, at the cost of the rate being
+2.0833 rather than 2.000, which makes `SpectrogramFFTsize` 1066 instead of 1024. Taking the last
+factor in software lands exactly on 2.000 MSPS for twice the USB traffic.
+
+The shipped configuration takes the first option and the backend should implement both, because the
+difference between them is one config key, not one code path.
 
 `sdr.h` already has the hook — `setOversample(Ratio)`, added for the RSPduo's fixed 2/6/8 MSPS ADC —
 and this is precisely what it was for: `setOversample(3)` at a 6 MSPS chip rate.
 
-One caveat the backend should keep: the ~31 MB/s link is shared with any other SDR on the board.
-6 MSPS ÷ 3 uses 23 MB/s of it; 4 MSPS ÷ 2 uses 15 MB/s for the same 2.0 MSPS output. If the RSPduo or
-the LimeSDR stream concurrently, prefer 4 ÷ 2.
+One caveat the backend should keep: the ~31 MB/s link is shared with any other SDR on the board. The
+device-decimation configuration uses 8.3 MB/s and is the friendliest to a busy bus; the software
+options use 15-23 MB/s for the same ~2 MSPS output.
 
 The tie-breaker is arithmetic that is not arbitrary: **8 x 2 000 000 / 15 625 = 1024 exactly**, so
 ogn-rf's spectrogram is the power-of-two FFT its author wrote it against. At 2 083 333 the same
