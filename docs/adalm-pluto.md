@@ -96,54 +96,50 @@ than derived. Too small a shift and the OGN pulses fold at the peaks; too large 
 noise costs the weak ones. The right value here is to be found by injecting a known level and
 sweeping gain with `pluto_probe`, and written down where the constant is defined.
 
-### 3. The chip decimates on-chip already, and USB is the ceiling
+### 3. The rate: the chip produces exactly 2.000 MSPS, with an FFT that divides by a power of two
 
-The constraint that decides the backend's architecture, now measured rather than reasoned about.
+**`ad9361_set_bb_rate(2000000)` makes the chip output 1 999 999 Hz with no host-side resampling.**
+The backend calls that, and nothing else touches the rate.
 
-`ogn-rf` asks for 1.0 MSPS by default (`ogn-rf.cc`) and 2.048 MSPS by inheritance from the RTL-SDR
-(`rtlsdr.h`, `sdr.h`). The chip's floor is **2 083 333 Hz**, so both are unreachable — and so is
-2.000 MSPS. One software step is therefore unavoidable to land on exactly 2.0.
+What this replaced is worth recording, because this branch's own text argued the opposite for a while.
+The plain `sampling_frequency` attribute bottoms out at **2 083 333 Hz** (ADC 25 MHz, HB stages ÷12),
+and 1.0 and 2.048 MSPS are rejected through it. `ad9361_set_bb_rate()` is a different path: it designs
+and loads an **RX FIR** with decimation up to ÷4 on top of the HB stages, and reaches far below that
+floor. Measured on the target, libad9361 0.2-1:
 
-What is worth stating plainly, because the opposite is easy to assume: **the chip decimates on every
-setting, and a higher sample rate does not put more work on it.** `rx_path_rates` shows the chain: at
-4 MSPS the ADC runs at 32 MHz and the filters are ÷8; at 61.44 MSPS the ADC runs at 491.52 MHz with
-the *same* ÷8. Only the minimum data rate gets the extra ÷12. And **USB saturates near 8 MSPS /
-31 MB/s** — requests for 15.36, 30.72 and 61.44 MSPS all delivered about 8 Msps and 31 MB/s, so the
-link, not the chip, is what limits a high rate.
+| `ad9361_set_bb_rate()` | Applied | ADC clock | Chain |
+|---|---|---|---|
+| 1 000 000 | 999 999 Hz | 32 MHz | ÷2 ÷2, FIR ÷4 |
+| **2 000 000** | **1 999 999 Hz** | **64 MHz** | ÷2 ÷2, FIR ÷4 |
+| 2 083 333 | 2 083 332 Hz | 66.7 MHz | ÷2 ÷2, FIR ÷2 |
 
-| Chip data rate | On-chip | Software | Into ogn-rf | USB | Measured (3 repeats, >=2 s) |
-|---|---|---|---|---|---|
-| **2 083 334** | **÷12** | **none** | **2 081 065** | **8.3 MB/s** | **99.8-99.9 %, +2-4 ms — clean** |
-| 4 000 000 | ÷8 | ÷2 box | 1 997 777 | 15.0 MB/s | 99.9 %, +2-3 ms — clean |
-| 6 000 000 | ÷8 | ÷3 box | 1 997 986 | 23.0 MB/s | 99.9 %, +2-3 ms — clean |
-| 8 000 000 | ÷8 | ÷4 box | ~1 950 000 | 31.0 MB/s | 95.2-95.6 % — **drops 2-5 % of samples** |
-| 10 000 000 | ÷8 | ÷5 box | 1 580 000 | over capacity | 78.8 % — real output collapses |
-| 16 000 000 | ÷8 | ÷8 box | 990 000 | over capacity | 49.5 % — real output collapses |
+**Exactly 2.000 rather than 2.083 decides itself, and not for any reason about USB.** `Inp_FFT::Preset()`
+computes `FFTsize = (8*8*SampleRate)/15625`:
 
-The three clean rows are indistinguishable on delivery, so the choice is not about throughput at all —
-it is about **where the last factor happens**. Having the chip do all of it (`2 083 334` / ÷1) puts
-2.081 MSPS on the wire from 8.3 MB/s and asks nothing of the host, at the cost of the rate being
-2.0833 rather than 2.000, which makes `SpectrogramFFTsize` 1066 instead of 1024. Taking the last
-factor in software lands exactly on 2.000 MSPS for twice the USB traffic.
+| SampleRate | OGN FFTsize | factorisation |
+|---|---|---|
+| 1 000 000 | 4096 | 2¹² |
+| **2 000 000** | **8192** | **2¹³** |
+| 2 048 000 | 8388 | 2²·3²·233 |
+| 2 083 333 | 8533 | 7·23·53 |
 
-The shipped configuration takes the first option and the backend should implement both, because the
-difference between them is one config key, not one code path.
+At 2.0833 MSPS the demodulator would run a 8533-point FFT whose size has 23 and 53 in it, which FFTW
+handles with generic codelets; at 2.000 it is a pure power of two. (Note `8*8`, not `8` — the `8*`
+form is `GSM_FFT`, the GSM calibration spectrogram.)
 
-`sdr.h` already has the hook — `setOversample(Ratio)`, added for the RSPduo's fixed 2/6/8 MSPS ADC —
-and this is precisely what it was for: `setOversample(3)` at a 6 MSPS chip rate.
+**Bandwidth: 4 MHz.** Unaided, `ad9361_set_bb_rate` picks 1 MHz; 4 MHz measured about 5 dB stronger
+at 100 MHz (rms 11.5 vs 6.5 %FS), and the driver's 18 MHz default is worse still. There is no reason
+to open the analogue filter wide to "encourage a high sample rate" — the ADC already runs at 64 MHz.
 
-One caveat the backend should keep: the ~31 MB/s link is shared with any other SDR on the board. The
-device-decimation configuration uses 8.3 MB/s and is the friendliest to a busy bus; the software
-options use 15-23 MB/s for the same ~2 MSPS output.
+Measured end to end: **99.9 % delivered, +2 ms overhead, 1.998 Msps sustained, 8.0 MB/s, rms 0.7 %FS,
+crest 5.34, nothing clipped**, with `filter_fir_en = 1`.
 
-The tie-breaker is arithmetic that is not arbitrary: **8 x 2 000 000 / 15 625 = 1024 exactly**, so
-ogn-rf's spectrogram is the power-of-two FFT its author wrote it against. At 2 083 333 the same
-expression gives 1066. And 2.0 MSPS is the rate the `rspduo` branch already settled on, so the
-frequency plan and gain measurements from that work stay comparable.
+Two implementation notes: call `ad9361_set_bb_rate()` and **do not** then write `sampling_frequency`,
+which undoes the FIR setup it just performed; and the FIR costs a few samples of group delay, which
+matters when computing the timestamp of a time slot.
 
-Validated on hardware: `-r 6000000 -D 3 -n 12000000` produced 4 000 000 samples at a nominal
-2 000 000 Hz over 2.000 s, 99.5 % delivered, rms 0.6 %FS, crest 5.33, nothing clipped. The filter is
-the same shape as ogn-rf's own `boxfilter.h`.
+USB remains the ceiling for anything faster — it saturates near 31 MB/s / 8 MSPS — but at 2.0 MSPS
+that is 8 MB/s and irrelevant.
 
 ## The attribute map
 
