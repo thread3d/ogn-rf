@@ -32,7 +32,7 @@
 
 #include "thread.h"     // multi-thread stuff
 #include "fft.h"        // Fast Fourier Transform
-#include "sdr.h"        // SDR radio: RTL-SDR, LimeSDR or RSPduo, chosen by RF.DeviceType
+#include "rtlsdr.h"     // SDR radio
 
 #define QUOTE(name) #name
 #define STR(macro) QUOTE(macro)
@@ -84,19 +84,13 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
                                                 // the goal is to listen on center frequency from 0.4 to 1.2 sec
    FreqPlan         HoppingPlan;                // frequency hopping plan (depends on the world region)
 
-   int  DeviceType;                             // 0=RTL-SDR, 1=LimeSDR, 2=RSPduo, see sdr.h
-   int  Oversample;                             // [LimeSDR] on-chip decimation ratio, 0 = driver decides
-   int  DualTuner;                              // [RSPduo] drive both tuners at once
-   int  SelectionDiversity;                     // [RSPduo] pick the better tuner per read
-   char ClockSource[16];                        // [LimeSDR] "internal" / "external", empty = leave alone
-   double ReferenceRate;                        // [LimeSDR] external reference clock rate [Hz], 0 = leave alone
    int  DeviceIndex;                            // rtl-sdr device index
    char DeviceSerial[64];                       // serial number of the rtl-sdr device to be selected
    int  OffsetTuning;                           // [bool] this option might be good for E4000 tuner
    int  BiasTee;                                // [bool] T-bias for external LNA power
    int  FreqCorr;                               // [ppm] frequency correction applied to the Rx chip
    int  FreqRaster;                             // [Hz] use only center frequencies on this raster to avoid tuning inaccuracies
-   SDR_Device SDR;                              // SDR receiver: RTL-SDR dongle or LimeSDR
+   RTLSDR SDR;                                  // SDR receiver (DVB-T stick)
    ReuseObjectQueue< SampleBuffer<uint8_t> > OutQueue; // OGN sample batches are sent there
 
    Thread Thr;                                  // acquisition thread
@@ -153,9 +147,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     OGN_GainMode=1; OGN_Gain=600;
     HoppingPlan.setPlan(0);
     PulseFilt.Threshold=0;
-    DeviceType=SDR_Device::RTL_SDR; DeviceIndex=0; DeviceSerial[0]=0; Oversample=0; DualTuner=0;
-    SelectionDiversity=0;
-    ClockSource[0]=0; ReferenceRate=0;
+    DeviceIndex=0; DeviceSerial[0]=0;
     OffsetTuning=0; FreqCorr=0; FreqRaster=28125; BiasTee=(-1);
     // GSM_CenterFreq=GSM_LowEdge+GSM_ScanStep/2; GSM_Scan=1; GSM_SamplesPerRead=(250*SampleRate)/1000; GSM_Gain=200;
     GSM_CenterFreq=0; GSM_Scan=0; GSM_Gain=200;
@@ -177,25 +169,12 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     config_lookup_float_or_int(Config,   "RF.FreqCorr", &Corr); FreqCorr = (int)floor(Corr+0.5);
     config_lookup_int(Config,   "RF.FreqRaster",     &FreqRaster);
     config_lookup_int(Config,   "RF.Device",         &DeviceIndex);
-    config_lookup_int(Config,   "RF.Oversample",     &Oversample);   // LimeSDR: capture N x rate, decimate on chip
-    const char *ClockSrc = 0;                                         // LimeSDR: internal / external reference
-    if(config_lookup_string(Config,"RF.ClockSource", &ClockSrc)==CONFIG_TRUE && ClockSrc)
-    { strncpy(ClockSource, ClockSrc, 16); ClockSource[15]=0; }
-    double RefRate = 0;                                               // LimeSDR: external reference rate [Hz]
-    config_lookup_float_or_int(Config, "RF.ReferenceRate", &RefRate); ReferenceRate=RefRate;
-    const char *DeviceTypeName = 0;                 // RF.DeviceType = "rtlsdr", "limesdr" or "rspduo"
-    if(config_lookup_string(Config,"RF.DeviceType", &DeviceTypeName)==CONFIG_TRUE)
-      DeviceType=SDR_Device::getTypeByString(DeviceTypeName);
-    else if(config_lookup_string(Config,"RF.SDR", &DeviceTypeName)==CONFIG_TRUE)   // accepted alias
-      DeviceType=SDR_Device::getTypeByString(DeviceTypeName);
     const char *Serial = 0;
     config_lookup_string(Config,"RF.DeviceSerial",   &Serial);
     if(Serial) { strncpy(DeviceSerial, Serial, 64); DeviceSerial[63]=0; }
     config_lookup_int(Config,   "RF.OfsTune",        &OffsetTuning);
     config_lookup_int(Config,   "RF.BiasTee",        &BiasTee);
     config_lookup_int(Config,   "RF.OGN.GainMode",   &OGN_GainMode);
-    config_lookup_int(Config,   "RF.RSPduo.DualTuner", &DualTuner);   // RSPduo: both tuners at once
-    config_lookup_int(Config,   "RF.RSPduo.SelectionDiversity", &SelectionDiversity);
 
     config_lookup_int(Config,   "RF.OGN.SaveRawData",   &OGN_SaveRawData);
 
@@ -349,16 +328,7 @@ Content-Disposition: attachment; filename=\"%s_%07.3fMHz_%03.1fMsps_%10dsec.jpg\
          else usleep(100000);
        }
        else                                                                // if not open yet or was closed due to an error
-       { SDR.setType(DeviceType);                                          // RTL-SDR dongle or LimeSDR
-         // The RSPduo mode has to be chosen before Open(): the API fixes it when the device is
-         // selected, so setting it afterwards would silently do nothing.
-         SDR.setRspDuoDualTuner(DualTuner);
-         // Selection diversity needs dual mode; both tuners then sit on the same frequency.
-         SDR.setRspDuoSelectionDiversity(SelectionDiversity);
-         SDR.setOversample(Oversample);                                    // must precede Open()
-         SDR.setClockSource(ClockSource);                                  // must precede Open()
-         SDR.setReferenceRate(ReferenceRate);
-         int Index=(-1);
+       { int Index=(-1);
          if(DeviceSerial[0]) Index=SDR.getDeviceIndexBySerial(DeviceSerial);
          if(Index<0) Index=DeviceIndex;
          SDR.FreqRaster = FreqRaster;
@@ -985,7 +955,7 @@ Refresh: 5\r\n\
      }
 
      if(RF->SDR.isOpen())
-     { dprintf(Client->SocketFile, "<tr><th>%s device #%d</th><th></th></tr>\n",                                    RF->SDR.getTypeName(RF->SDR.getType()), RF->SDR.DeviceIndex);
+     { dprintf(Client->SocketFile, "<tr><th>RTL-SDR device #%d</th><th></th></tr>\n",                                  RF->SDR.DeviceIndex);
        dprintf(Client->SocketFile, "<tr><td>Name</td><td align=right><b>%s</b></td></tr>\n",                           RF->SDR.getDeviceName());
        dprintf(Client->SocketFile, "<tr><td>Tuner type</td><td align=right><b>%s</b></td></tr>\n",                     RF->SDR.getTunerTypeName());
        char Manuf[256], Product[256], Serial[256];
@@ -1003,14 +973,6 @@ Refresh: 5\r\n\
 #endif
        dprintf(Client->SocketFile, "<tr><td>Center frequency</td><td align=right><b>%7.3f MHz</b></td></tr>\n",        1e-6*RF->SDR.getCenterFreq());
        dprintf(Client->SocketFile, "<tr><td>Sample rate</td><td align=right><b>%5.3f MHz</b></td></tr>\n",             1e-6*RF->SDR.getSampleRate());
-       if(RF->SDR.haveTunerB())
-         dprintf(Client->SocketFile, "<tr><td>Tuner B (dual mode)</td><td align=right><b>%7.3f MHz</b></td></tr>\n",
-                 1e-6*RF->SDR.getCenterFreqB());
-       if(RF->SDR.haveRspDuoDiversity())
-       { uint64_t ca=RF->SDR.getRspDuoDivChoseA(), cb=RF->SDR.getRspDuoDivChoseB();
-         dprintf(Client->SocketFile, "<tr><td>Selection diversity</td><td align=right><b>A %llu / B %llu, %llu switches</b></td></tr>\n",
-                 (unsigned long long)ca, (unsigned long long)cb,
-                 (unsigned long long)RF->SDR.getRspDuoDivSwitches()); }
        dprintf(Client->SocketFile, "<tr><td>Frequency correction</td><td align=right><b>%+5.1f ppm</b></td></tr>\n",   RF->FreqCorr + RF->GSM_FreqCorr);
        dprintf(Client->SocketFile, "<tr><td>Live Time</td><td align=right><b>%5.1f%%</b></td></tr>\n",         100*RF->getLifeTime());
        uint32_t RtlFreq, TunerFreq; RF->SDR.getXtalFreq(RtlFreq, TunerFreq);
@@ -1027,7 +989,6 @@ Refresh: 5\r\n\
 
      dprintf(Client->SocketFile, "<tr><th>RF</th><th></th></tr>\n");
      dprintf(Client->SocketFile, "<tr><td>RF.FreqPlan</td><td align=right><b>%d: %s</b></td></tr>\n",   RF->HoppingPlan.Plan, RF->HoppingPlan.getPlanName() );
-     dprintf(Client->SocketFile, "<tr><td>RF.DeviceType</td><td align=right><b>%s</b></td></tr>\n",                   RF->SDR.getTypeName(RF->DeviceType));
      dprintf(Client->SocketFile, "<tr><td>RF.Device</td><td align=right><b>%d</b></td></tr>\n",                       RF->DeviceIndex);
      if(RF->DeviceSerial[0])
        dprintf(Client->SocketFile, "<tr><td>RF.DeviceSerial</td><td align=right><b>%s</b></td></tr>\n",               RF->DeviceSerial);
@@ -1045,16 +1006,6 @@ Refresh: 5\r\n\
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.Enable</td><td align=right><b>%d</b></td></tr>\n",                  FFT->Filter->Enable);
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.FFTsize</td><td align=right><b>%d</b></td></tr>\n",                 FFT->Filter->FFTsize);
      // dprintf(Client->SocketFile, "<tr><td>RF.ToneFilter.Threshold</td><td align=right><b>%3.1f</b></td></tr>\n",            FFT->Filter->Threshold);
-     if(RF->SDR.HaveLimeSDR())
-     { dprintf(Client->SocketFile, "<tr><td>RF.Oversample</td><td align=right><b>%d (auto) / applied %d</b></td></tr>\n",
-               RF->Oversample, RF->SDR.getOversampleApplied());
-       if(RF->ClockSource[0] || RF->SDR.getClockSourceApplied()[0])
-         dprintf(Client->SocketFile, "<tr><td>RF.ClockSource</td><td align=right><b>%s / device says %s</b></td></tr>\n",
-                 RF->ClockSource[0]?RF->ClockSource:"(unset)",
-                 RF->SDR.getClockSourceApplied()[0]?RF->SDR.getClockSourceApplied():"(none)");
-       if(RF->ReferenceRate>0)
-         dprintf(Client->SocketFile, "<tr><td>RF.ReferenceRate</td><td align=right><b>%5.3f MHz</b></td></tr>\n",
-                 1e-6*RF->ReferenceRate); }
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.GainMode</td><td align=right><b>%d</b></td></tr>\n",                 RF->OGN_GainMode);
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.Gain</td><td align=right><b>%4.1f dB</b></td></tr>\n",           0.1*RF->OGN_Gain);
      // dprintf(Client->SocketFile, "<tr><td>RF.OGN.CenterFreq</td><td align=right><b>%5.1f MHz</b></td></tr>\n",   1e-6*RF->OGN_CenterFreq);

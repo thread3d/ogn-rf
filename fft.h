@@ -30,30 +30,6 @@
 
 #include <fftw3.h>
 
-// ---------------------------------------------------------------------------
-// FFTW planning flag
-//
-// FFTW_MEASURE benchmarks candidate algorithms at plan time. That is normally a
-// good trade, but SINGLE-precision planning is pathologically slow on some ARM
-// hosts. Measured on a Jetson Xavier AGX (Ubuntu 20.04, aarch64, libfftw3f3):
-//
-//     float   4096 pt FFTW_MEASURE : 37.144 s      double  4096 pt : 0.022 s
-//     float  32768 pt FFTW_MEASURE : 60.858 s      double 32768 pt : 0.038 s
-//
-// ogn-rf plans three float transforms in global constructors (Inp_Filter plans
-// 32768 points, Inp_FFT 4096, GSM_FFT likewise), so FFTW_MEASURE stalls startup
-// for over two minutes BEFORE main() is reached - at 100% of one core, silently,
-// looking exactly like a hang. FFTW_ESTIMATE plans instantly; the cost is a few
-// percent per transform. Override if your host measures cheaply:
-//
-//     make FLAGS="... -DFFTW_PLAN_FLAG=FFTW_MEASURE"
-// ---------------------------------------------------------------------------
-#ifndef FFTW_PLAN_FLAG
-#define FFTW_PLAN_FLAG FFTW_ESTIMATE
-#endif
-
-
-
 // ===========================================================================================
 
 template <class Float>
@@ -76,7 +52,7 @@ template <class Float>
   { if( (Size==this->Size) && (Sign==this->Sign) ) return Size;
     Free();
     Buffer = (std::complex<Float> *)fftw_malloc(Size*sizeof(std::complex<Float>)); if(Buffer==0) return -1;
-    Plan = fftw_plan_dft_1d(Size, (fftw_complex *)Buffer, (fftw_complex *)Buffer, Sign, FFTW_PLAN_FLAG);
+    Plan = fftw_plan_dft_1d(Size, (fftw_complex *)Buffer, (fftw_complex *)Buffer, Sign, FFTW_MEASURE);
     this->Size=Size; this->Sign=Sign; return Size; }
 
   int PresetForward(int Size) { return Preset(Size, FFTW_FORWARD); }
@@ -118,7 +94,7 @@ template <>
   { if( (Size==this->Size) && (Sign==this->Sign) ) return Size;
     Free();
     Buffer = (std::complex<float> *)fftwf_malloc(Size*sizeof(std::complex<float>)); if(Buffer==0) return -1;
-    Plan = fftwf_plan_dft_1d(Size, (fftwf_complex *)Buffer, (fftwf_complex *)Buffer, Sign, FFTW_PLAN_FLAG);
+    Plan = fftwf_plan_dft_1d(Size, (fftwf_complex *)Buffer, (fftwf_complex *)Buffer, Sign, FFTW_MEASURE);
     this->Size=Size; this->Sign=Sign; return Size; }
 
   int PresetForward(int Size) { return Preset(Size, FFTW_FORWARD); }

@@ -56,8 +56,13 @@
 //   * Sample rate - the RSPduo's ADC runs at 2, 6 or 8 MHz in single-tuner mode. A requested
 //     rate is snapped to the nearest supported value and the rate actually applied is reported,
 //     because a silent 2 % rate error would slide every OGN channel off its bin.
-//   * Bias tee - the RSPduo has no bias tee (the RSP2 and RSPdx do), so setBiasTee() records
-//     the request and reports success; the config option is accepted and ignored.
+//   * Bias tee - the RSPduo DOES have one, and this backend used to ignore it on the mistaken
+//     belief that it did not. It is on the TUNER 2 PORT ONLY, 4.7 V at 100 mA, so it can power an
+//     antenna-mounted LNA on that port and nothing on the other. Enabled through
+//     rspDuoTunerParams.biasTEnable with sdrplay_api_Update_RspDuo_BiasTControl.
+//     That reason sits in the API's per-tuner section, not the master-only one, so it must be
+//     applied to TUNER B - the port it physically feeds. Applying it to tuner A silently does
+//     nothing, which is what this backend did at first.
 //   * Offset tuning - an RTL-SDR/E4000 trick with no meaning here; accepted and ignored.
 //   * getTunerGains() - the RSPduo has no discrete tuner gain table. The API exposes gain as an
 //     IF gain reduction (gRdB) plus an LNA state, so a table is synthesised from the device's
@@ -293,7 +298,11 @@ class RSPDuo
      #endif
      AverPeriod=100.0;
      SamplePeriod=1.0/2000000.0; SampleTime=0; StartTime=0; PrevTime=0; SampleTime_DMS=0.0001*0.0001;
-     GainOffset=115.8; GRdB_set=GR_DB_MIN; LNAstate=0; BiasTee=(-1); DcOffsetCorrect=1;
+     // Start at a MID gain, not the maximum. ogn-rf calls Open() and only then setTunerGain(),
+     // so the receiver streams briefly at whatever this default is. At GR_DB_MIN (maximum gain)
+     // that window overloads the ADC whenever an LNA is in front - measured as a burst of
+     // "ADC overload detected" at every open. Mid-range is a far safer starting point.
+     GainOffset=115.8; GRdB_set=50; LNAstate=0; BiasTee=(-1); DcOffsetCorrect=1;
      RspDuoMode=sdrplay_api_RspDuoMode_Single_Tuner; DualMode=0;
      DualBw=sdrplay_api_BW_0_600; DualIf=sdrplay_api_IF_0_450; DualDecimation=2;
      FreqB=0;
@@ -668,6 +677,11 @@ class RSPDuo
        Ctrl.decimation.enable = (Decimation>1) ? 1 : 0;
        Ctrl.decimation.decimationFactor = (unsigned char)(Decimation>1 ? Decimation : 1);
        Ctrl.agc.enable        = sdrplay_api_AGC_DISABLE;   // manual gain: ogn-rf owns the gain
+
+       // The bias tee feeds the TUNER 2 port, and its update reason is per-tuner, so the flag
+       // belongs to channel B. Only fall back to A when there is no channel B (single-tuner mode).
+       if( (Params->rxChannelB!=0 && Ch==1) || (Params->rxChannelB==0 && Ch==0) )
+         Chan->rspDuoTunerParams.biasTEnable = (BiasTee>0) ? 1 : 0;
      }
 
      SampleRateApplied = Rate/(double)(Decimation>1 ? Decimation : 1);
@@ -919,7 +933,28 @@ class RSPDuo
    // Options with no RSPduo hardware behind them
    // -----------------------------------------------------------------------------------------------
 
-   int setBiasTee(int On=1) { BiasTee=On; return 0; }   // the RSPduo has no bias tee
+   // Bias tee: 4.7 V at 100 mA, on the TUNER 2 port only. Live changes go through
+   // sdrplay_api_Update_RspDuo_BiasTControl. That reason is in the API's per-tuner group, so it
+   // is applied to TUNER B - the port the 4.7 V comes out of - and NOT to tuner A.
+   int setBiasTee(int On=1)
+   { BiasTee=On;
+     if(Params==0) return 0;                              // recorded; applied at the next Open()
+     sdrplay_api_RxChannelParamsT *Port=(Params->rxChannelB!=0) ? Params->rxChannelB
+                                                                : Params->rxChannelA;
+     if(Port==0) return 0;
+     Port->rspDuoTunerParams.biasTEnable = (On>0) ? 1 : 0;
+     if(!Streaming) return 0;
+     sdrplay_api_TunerSelectT Which=(Params->rxChannelB!=0) ? sdrplay_api_Tuner_B
+                                                            : sdrplay_api_Tuner_A;
+     sdrplay_api_ErrT Err=sdrplay_api_Update(Device.dev, Which,
+                                             sdrplay_api_Update_RspDuo_BiasTControl,
+                                             sdrplay_api_Update_Ext1_None);
+     if(Err!=sdrplay_api_Success)
+     { printf("RSPduo::setBiasTee(%d) => Update() failed: %s\n", On, sdrplay_api_GetErrorString(Err));
+       return -1; }
+     printf("RSPduo::setBiasTee(%d) => 4.7 V %s on the Tuner 2 port (tuner %s)\n",
+            On, On>0 ? "ON" : "OFF", (Params->rxChannelB!=0) ? "B" : "A");
+     return 0; }
    int setOffsetTuning(int ON=1) { (void)ON; return 0; }
 
    int setRspDuoMode(int Mode) { RspDuoMode=Mode; return 0; }   // takes effect at the next Open()
