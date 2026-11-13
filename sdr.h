@@ -344,6 +344,29 @@ class SDR_Device
      return 0;
    }
 
+   // Ring overruns: the measure of whether the backend kept up with the device. Any non-zero
+   // value means samples were discarded because a reader fell behind, which is data loss the
+   // Live Time figure cannot distinguish from ogn-rf simply not asking.
+   uint64_t getRspDuoOverflows(int Tuner)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.getOverflows(Tuner);
+#else
+     (void)Tuner;
+#endif
+     return 0;
+   }
+
+   uint64_t getRspDuoBytesRead(int Tuner)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.getBytesRead(Tuner);
+#else
+     (void)Tuner;
+#endif
+     return 0;
+   }
+
    uint64_t getRspDuoDivSwitches(void)
    {
 #ifdef USE_RSPDUO
