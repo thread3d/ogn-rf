@@ -1109,6 +1109,12 @@ Refresh: 5\r\n\
                  1e-6*RF->ReferenceRate); }
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.GainMode</td><td align=right><b>%d</b></td></tr>\n",                 RF->OGN_GainMode);
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.Gain</td><td align=right><b>%4.1f dB</b></td></tr>\n",           0.1*RF->OGN_Gain);
+     // What the radio reports it actually applied, which is not the same thing as what was asked
+     // for: the RSPduo turns a total gain into an IF gain reduction, clamps it to its own range,
+     // and reports the result back on every gain change. Showing both is how a request that never
+     // arrived gets noticed - the ADC overload events that would not go away at any configured
+     // gain were eventually traced to the second tuner keeping its startup gain.
+     dprintf(Client->SocketFile, "<tr><td>Gain applied by device</td><td align=right><b>%4.1f dB</b></td></tr>\n",  0.1*RF->SDR.getTunerGain());
      // dprintf(Client->SocketFile, "<tr><td>RF.OGN.CenterFreq</td><td align=right><b>%5.1f MHz</b></td></tr>\n",   1e-6*RF->OGN_CenterFreq);
      // dprintf(Client->SocketFile, "<tr><td>RF.OGN.FreqHopChannels</td><td align=right><b>%d</b></td></tr>\n",          RF->OGN_FreqHopChannels);
      dprintf(Client->SocketFile, "<tr><td>RF.OGN.StartTime</td><td align=right><b>%5.3f sec</b></td></tr>\n",         RF->OGN_StartTime);

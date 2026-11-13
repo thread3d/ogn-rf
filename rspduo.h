@@ -298,11 +298,18 @@ class RSPDuo
      #endif
      AverPeriod=100.0;
      SamplePeriod=1.0/2000000.0; SampleTime=0; StartTime=0; PrevTime=0; SampleTime_DMS=0.0001*0.0001;
-     // Start at a MID gain, not the maximum. ogn-rf calls Open() and only then setTunerGain(),
-     // so the receiver streams briefly at whatever this default is. At GR_DB_MIN (maximum gain)
-     // that window overloads the ADC whenever an LNA is in front - measured as a burst of
-     // "ADC overload detected" at every open. Mid-range is a far safer starting point.
-     GainOffset=115.8; GRdB_set=50; LNAstate=0; BiasTee=(-1); DcOffsetCorrect=1;
+     // Start at the QUIETEST gain, not the maximum and not mid-range. ogn-rf calls Open() and only
+     // then setTunerGain(), so the receiver always streams for a moment at whatever this default
+     // is, and that window has to be safe for whatever is plugged in.
+     //
+     // Mid-range was tried and is not safe enough: measured with an LNA in front, opening at
+     // gRdB 50 produced 18 "ADC overload detected" events in six seconds, i.e. a real overload
+     // rather than a startup blip. At gRdB 59 the same chain clears it. Worse, on this API a
+     // stream that starts overloaded keeps reporting over a later live gain update - the same
+     // configuration at RF.OGN.Gain 56.8 still logged 29 detections in twelve seconds even after
+     // the device confirmed it had applied 56.8 dB - so the overload has to be avoided during the
+     // open window rather than corrected afterwards.
+     GainOffset=115.8; GRdB_set=GR_DB_MAX; LNAstate=0; BiasTee=(-1); DcOffsetCorrect=1;
      RspDuoMode=sdrplay_api_RspDuoMode_Single_Tuner; DualMode=0;
      DualBw=sdrplay_api_BW_0_600; DualIf=sdrplay_api_IF_0_450; DualDecimation=2;
      FreqB=0;
@@ -870,12 +877,29 @@ class RSPDuo
      Params->rxChannelA->tunerParams.gain.gRdB     = GRdB_set;
      Params->rxChannelA->tunerParams.gain.LNAstate = (unsigned char)LNAstate;
 
+     // In dual mode channel B has its own gain settings, and sdrplay_api_Init() leaves them at the
+     // gain Open() happened to use. A live change that only touches A therefore leaves B running
+     // at the startup gain for ever - which is exactly what was observed: a configuration set to
+     // the quietest IF gain (RF.OGN.Gain 56.8) still logged ADC overload events every few seconds,
+     // and they were all B's, still 9 dB louder than A. Every tuner B read then also arrived at a
+     // different level than the gain the demodulator was told to expect.
+     bool BFollows=(DualMode && TunerBEnabled && Params->rxChannelB!=0);
+     if(BFollows)
+     { Params->rxChannelB->tunerParams.gain.gRdB     = GRdB_set;
+       Params->rxChannelB->tunerParams.gain.LNAstate = (unsigned char)LNAstate; }
+
      if(Streaming)
      { sdrplay_api_ErrT Err=sdrplay_api_Update(Device.dev, sdrplay_api_Tuner_A,
                                                sdrplay_api_Update_Tuner_Gr, sdrplay_api_Update_Ext1_None);
        if(Err!=sdrplay_api_Success)
        { printf("RSPduo::setTunerGain(%d) => Update() failed: %s\n", Requested, sdrplay_api_GetErrorString(Err));
-         return -1; } }
+         return -1; }
+       if(BFollows)
+       { sdrplay_api_ErrT ErrB=sdrplay_api_Update(Device.dev, sdrplay_api_Tuner_B,
+                                                  sdrplay_api_Update_Tuner_Gr, sdrplay_api_Update_Ext1_None);
+         if(ErrB!=sdrplay_api_Success)
+         { printf("RSPduo::setTunerGain(%d) => Update(Tuner_B) failed: %s\n", Requested, sdrplay_api_GetErrorString(ErrB));
+           return -1; } } }
 
      BuildGainTable();
      return 0; }
