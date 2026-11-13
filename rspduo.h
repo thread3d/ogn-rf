@@ -871,19 +871,28 @@ class RSPDuo
      if(GRdB<GR_DB_MIN) GRdB=GR_DB_MIN;
      if(GRdB>GR_DB_MAX) GRdB=GR_DB_MAX;
 
-     GRdB_set=(int)lround(GRdB);
-     LNAstate=0;
+     int NewGRdB=(int)lround(GRdB);
+     int NewLNA =0;
+
+     // Nothing to push down when the tuners are already there. ogn-rf calls this straight after
+     // Open(), and Open() now starts at the configured gain, so this is the common path: the values
+     // already match and the Update - which restarts the tuner - is skipped.
+     bool BFollows=(DualMode && TunerBEnabled && Params->rxChannelB!=0);
+     bool AAlready=(Params->rxChannelA->tunerParams.gain.gRdB==(unsigned)NewGRdB)
+                && (Params->rxChannelA->tunerParams.gain.LNAstate==(unsigned char)NewLNA);
+     bool BAlready=(!BFollows)
+                || ( Params->rxChannelB->tunerParams.gain.gRdB==(unsigned)NewGRdB
+                  && Params->rxChannelB->tunerParams.gain.LNAstate==(unsigned char)NewLNA );
+     GRdB_set=NewGRdB; LNAstate=NewLNA;
+     if(AAlready && BAlready) { BuildGainTable(); return 0; }
 
      Params->rxChannelA->tunerParams.gain.gRdB     = GRdB_set;
      Params->rxChannelA->tunerParams.gain.LNAstate = (unsigned char)LNAstate;
 
      // In dual mode channel B has its own gain settings, and sdrplay_api_Init() leaves them at the
-     // gain Open() happened to use. A live change that only touches A therefore leaves B running
-     // at the startup gain for ever - which is exactly what was observed: a configuration set to
-     // the quietest IF gain (RF.OGN.Gain 56.8) still logged ADC overload events every few seconds,
-     // and they were all B's, still 9 dB louder than A. Every tuner B read then also arrived at a
-     // different level than the gain the demodulator was told to expect.
-     bool BFollows=(DualMode && TunerBEnabled && Params->rxChannelB!=0);
+     // gain Open() happened to use, so a live change has to be pushed to B as well - otherwise B
+     // runs at the startup gain for ever and every tuner B read arrives at a level the demodulator
+     // was not told to expect.
      if(BFollows)
      { Params->rxChannelB->tunerParams.gain.gRdB     = GRdB_set;
        Params->rxChannelB->tunerParams.gain.LNAstate = (unsigned char)LNAstate; }
@@ -903,6 +912,22 @@ class RSPDuo
 
      BuildGainTable();
      return 0; }
+
+   // The gain the stream will start at, for ogn-rf to set before Open(). ogn-rf calls
+   // setTunerGain() only afterwards, so without this the receiver always opened at whatever the
+   // constructor chose and then moved.
+   //
+   // Starting at the wanted gain also means setTunerGain() becomes a no-op immediately after
+   // Open(), and a live gain Update is not free on this unit (see the guard there).
+   //
+   // This is not a fix for the "ADC overload detected" reports, which are intermittent on this unit
+   // and do not track level, gain or this change. It is here so the receiver never opens louder than
+   // it is configured to run, and so setTunerGain() has nothing to push.
+   void setTunerGainPreset(int Requested)
+   { double GRdB=GainOffset-0.1*(double)Requested;
+     if(GRdB<GR_DB_MIN) GRdB=GR_DB_MIN;
+     if(GRdB>GR_DB_MAX) GRdB=GR_DB_MAX;
+     GRdB_set=(int)lround(GRdB); LNAstate=0; }
 
    int setTunerGainMode(int Manual=1) { (void)Manual; return 0; }   // AGC is disabled in Open()
    int setTunerGainManual(int Manual=1) { return setTunerGainMode(Manual); }
@@ -973,6 +998,15 @@ class RSPDuo
    int setFreqCorrection(int PPM)
    { FreqCorr=PPM;
      if(Params==0) return 0;                 // recorded, applied at the next Open()
+     // An unchanged ppm is not worth a device-level Update: it restarts the tuner for nothing, and
+     // ogn-rf sets its configured values straight after Open(), which has just programmed the same
+     // ones - so the redundant Update was the normal case rather than a rare one.
+     //
+     // Do not read the "ADC overload detected" stream as feedback on anything here. It was 0 over
+     // 100 s with these guards in place and 67 within the first 35 s of the next run, same binary,
+     // same configuration, same signal level; and an independent client on this unit reports none
+     // at all. See docs/status-log.md, session 17.
+     if(Params->devParams->ppm==(double)PPM) return 0;
      Params->devParams->ppm=(double)PPM;
      if(Streaming)
      { sdrplay_api_ErrT Err=sdrplay_api_Update(Device.dev, sdrplay_api_Tuner_A,
@@ -1019,7 +1053,11 @@ class RSPDuo
      sdrplay_api_RxChannelParamsT *Port=(Params->rxChannelB!=0) ? Params->rxChannelB
                                                                 : Params->rxChannelA;
      if(Port==0) return 0;
-     Port->rspDuoTunerParams.biasTEnable = (On>0) ? 1 : 0;
+     int Want=(On>0) ? 1 : 0;
+     if(Port->rspDuoTunerParams.biasTEnable==Want)
+     { BiasTee=On; return 0; }            // already in that state; Open() programmed it, and a
+                                          // redundant update restarts the tuner for nothing
+     Port->rspDuoTunerParams.biasTEnable = Want;
      if(!Streaming) return 0;
      sdrplay_api_TunerSelectT Which=(Params->rxChannelB!=0) ? sdrplay_api_Tuner_B
                                                             : sdrplay_api_Tuner_A;

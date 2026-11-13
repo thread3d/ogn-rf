@@ -322,6 +322,18 @@ class SDR_Device
 #endif
    }
 
+   // RSPduo only: the gain the stream should start at, set before Open(). ogn-rf applies its
+   // configured gain after Open(), and on this unit a live gain update leaves the API reporting
+   // power overload continuously; starting at the wanted gain avoids that update entirely.
+   void setRspDuoGainPreset(int Gain)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) Rsp.setTunerGainPreset(Gain);
+#else
+     (void)Gain;
+#endif
+   }
+
    // RSPduo only: selection diversity between the two tuners (both on one frequency, the
    // stronger one used per read). Ignored by every other radio.
    void setRspDuoSelectionDiversity(int On)

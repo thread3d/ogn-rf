@@ -397,6 +397,7 @@ Content-Disposition: attachment; filename=\"%s_%07.3fMHz_%03.1fMsps_%10dsec.jpg\
          // Both take effect at Open(): the API fixes the RSPduo mode when the device is selected.
          SDR.setRspDuoDualTuner(DualTuner);
          SDR.setRspDuoSelectionDiversity(SelectionDiversity);
+         SDR.setRspDuoGainPreset(OGN_Gain);                                 // start at the wanted gain
          SDR.setOversample(Oversample);                                    // must precede Open()
          SDR.setClockSource(ClockSource);                                  // must precede Open()
          SDR.setReferenceRate(ReferenceRate);
