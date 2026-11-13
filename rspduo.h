@@ -496,6 +496,29 @@ class RSPDuo
        if(fabs(Wanted-Rate[Idx])<BestErr) { Best=Rate[Idx]; BestErr=fabs(Wanted-Rate[Idx]); }
      return Best; }
 
+   // The rate the host will actually be given for a requested rate, worked out from the settings
+   // alone - no hardware, no API service, safe to call before Open().
+   //
+   // This has to be answerable before Open(), because ogn-rf sizes everything that depends on the
+   // sample rate - how many samples make up one time slot, the demodulator's FFT size, the width
+   // of the hopping band - from a single number read at startup. In single-tuner mode that number
+   // is the ADC rate snapped to 2/6/8 MHz and divided by the decimation. In dual-tuner mode it is
+   // not negotiable at all: the API fixes the delivered rate from its (ADC rate, bandwidth, IF)
+   // combination, which for the default 2 MHz / 0.6 MHz / IF 450 kHz is 1 Msps per tuner - half
+   // the rate RF.SampleRate asks the ADC for. Assuming the requested rate instead makes ogn-rf ask
+   // for twice the samples the radio can deliver in a slot, so every read takes twice its slot and
+   // the demodulator plans for a stream 2x faster than the one it is fed.
+   uint32_t predictSampleRate(uint32_t Wanted)
+   { // RspDuoMode, not DualMode: the latter is only derived from it inside Open(), and the whole
+     // point of this function is to be answerable before Open() has ever run.
+     if(RspDuoMode==sdrplay_api_RspDuoMode_Dual_Tuner)
+     { double Rate=2000000.0; int Dec=1;
+       DualCombo(Rate, Dec);
+       return (uint32_t)lround(Rate/(double)(Dec>1 ? Dec : 1)); }
+     int Dec=1;
+     double Rate=SnapSampleRate((double)Wanted, Dec);
+     return (uint32_t)lround(Rate/(double)(Dec>1 ? Dec : 1)); }
+
    // -----------------------------------------------------------------------------------------------
    // Dual-tuner mode: a much stricter set of valid combinations
    //
@@ -674,8 +697,17 @@ class RSPDuo
        // (868.300), which sits BETWEEN the two OGN channels and therefore does no harm.
        Ctrl.dcOffset.DCenable = DcOffsetCorrect ? 1 : 0;
        Ctrl.dcOffset.IQenable = DcOffsetCorrect ? 1 : 0;
-       Ctrl.decimation.enable = (Decimation>1) ? 1 : 0;
-       Ctrl.decimation.decimationFactor = (unsigned char)(Decimation>1 ? Decimation : 1);
+       // In dual mode the decimation belongs to the API: the dual-tuner combination (ADC rate,
+       // bandwidth, IF) already fixes it, and the host-side decimation controls have to stay OFF.
+       // Programming DualCombo's factor on top decimates a second time - measured with the probe,
+       // dual mode, bw 0.6 MHz, 2 MHz ADC: 1.008 Msps delivered with the controls off, 0.504 Msps
+       // with factor 2 set. So the stream arrived at half the rate the combination says and at
+       // half the rate this file reported, which is why every slot read in dual mode took twice
+       // as long as the sample count implied. Single-tuner mode has no such combination and does
+       // need the controls; there the factor is the only way below 2 MHz.
+       int HostDecimation = DualMode ? 1 : Decimation;
+       Ctrl.decimation.enable = (HostDecimation>1) ? 1 : 0;
+       Ctrl.decimation.decimationFactor = (unsigned char)(HostDecimation>1 ? HostDecimation : 1);
        Ctrl.agc.enable        = sdrplay_api_AGC_DISABLE;   // manual gain: ogn-rf owns the gain
 
        // The bias tee feeds the TUNER 2 port, and its update reason is per-tuner, so the flag
@@ -860,6 +892,27 @@ class RSPDuo
    { if(FreqRaster) { uint32_t Div=(Frequency+(FreqRaster>>1))/FreqRaster; Frequency=Div*FreqRaster; }
      FreqApplied=(double)Frequency;
      if(Params==0 || Params->rxChannelA==0) return -1;
+
+     // Retuning is the most expensive thing the acquisition loop asks of this backend, and asking
+     // for the frequency it is already on is the common case rather than an edge case: the
+     // European OGN plan puts 868.200 and 868.400 inside one capture window, so ogn-rf works out
+     // the same centre frequency for ever and still calls this once per slot.
+     //
+     // What an unnecessary Update() costs was measured with the acquisition loop traced: 0.40 s
+     // per call in single-tuner mode, 0.80 s in dual - up to half of a one-second slot spent
+     // restarting a stream that did not need to move. It also truncates the stream: the API
+     // restarts it and the callback returns with reset=1, so the slot's buffered samples are
+     // discarded as well as the time. In dual mode the ring was measured taking 500 ksps while
+     // the API itself provides 1.008 Msps, which is the signature of half the stream being lost
+     // to those restarts.
+     //
+     // The LimeSDR backend guards its own 60 ms retune the same way, for the same reason.
+     bool BFollows=(Diversity && TunerBEnabled && Params->rxChannelB!=0);
+     if( (Params->rxChannelA->tunerParams.rfFreq.rfHz==(double)Frequency)
+      && (!BFollows || (Params->rxChannelB->tunerParams.rfFreq.rfHz==(double)Frequency)) )
+     { if(BFollows) { FreqB=(double)Frequency; FreqBApplied=FreqB; }
+       return 0; }
+
      Params->rxChannelA->tunerParams.rfFreq.rfHz=(double)Frequency;
      Params->rxChannelA->tunerParams.rfFreq.syncUpdate=1;
      if(Streaming)
@@ -870,7 +923,7 @@ class RSPDuo
          return -1; } }
 
      // Diversity is only meaningful if both tuners see the same channel, so tuner B follows A.
-     if(Diversity && TunerBEnabled && Params->rxChannelB)
+     if(BFollows)
      { FreqB=(double)Frequency; FreqBApplied=FreqB;
        Params->rxChannelB->tunerParams.rfFreq.rfHz=(double)Frequency;
        Params->rxChannelB->tunerParams.rfFreq.syncUpdate=1;

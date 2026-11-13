@@ -75,7 +75,8 @@ template <class Float> // scale floating-point data to 8-bit gray scale image
 
 class RF_Acq                                    // acquire wideband (1MHz) RF data thus both OGN frequencies at same time
 { public:
-   int    SampleRate;                           // [Hz] sampling rate
+   int    SampleRate;                           // [Hz] rate the host is actually fed, after the device has had its say
+   int    AdcRate;                              // [Hz] RF.SampleRate as written: what the radio is asked for
 
    int    OGN_GainMode;                         // 0=Auto, 1=Manual, 2=Linearity, 3=Sensitivity
    int    OGN_Gain;                             // [0.1dB] Rx gain for OGN reception
@@ -148,7 +149,7 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
     return 0.5*CountLifeTimeSlots/(Now-StartTime); }
 
   void Config_Defaults(void)
-  { SampleRate=1000000;
+  { SampleRate=1000000; AdcRate=SampleRate;
     OGN_StartTime=0.375; OGN_SamplesPerRead=(850*SampleRate)/1000;
     OGN_GainMode=1; OGN_Gain=600;
     HoppingPlan.setPlan(0);
@@ -199,13 +200,33 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
 
     config_lookup_int(Config,   "RF.OGN.SaveRawData",   &OGN_SaveRawData);
 
-    SampleRate=1000000;
-    if(config_lookup_int(Config, "RF.OGN.SampleRate", &SampleRate)!=CONFIG_TRUE)
+    AdcRate=1000000;
+    if(config_lookup_int(Config, "RF.OGN.SampleRate", &AdcRate)!=CONFIG_TRUE)
     { double Rate;
-      if(config_lookup_float(Config, "RF.OGN.SampleRate", &Rate)==CONFIG_TRUE) SampleRate=(int)floor(1e6*Rate+0.5);
-      else if(config_lookup_int(Config, "RF.SampleRate", &SampleRate)!=CONFIG_TRUE)
-      { if(config_lookup_float(Config, "RF.SampleRate", &Rate)==CONFIG_TRUE) SampleRate=(int)floor(1e6*Rate+0.5); }
+      if(config_lookup_float(Config, "RF.OGN.SampleRate", &Rate)==CONFIG_TRUE) AdcRate=(int)floor(1e6*Rate+0.5);
+      else if(config_lookup_int(Config, "RF.SampleRate", &AdcRate)!=CONFIG_TRUE)
+      { if(config_lookup_float(Config, "RF.SampleRate", &Rate)==CONFIG_TRUE) AdcRate=(int)floor(1e6*Rate+0.5); }
     }
+
+    // RF.SampleRate is what the radio is *asked* for, which is not always what the host is fed:
+    // the RSPduo's ADC only runs at 2, 6 or 8 MHz, and in dual-tuner mode the API derives the
+    // delivered rate from its own fixed (ADC rate, bandwidth, IF) combination - 1 Msps per tuner
+    // for the defaults, i.e. half of what is asked. Everything downstream is sized from the
+    // delivered rate: how many samples make up a time slot, the demodulator's FFT, the width of
+    // the hopping band. Using the requested rate instead makes ogn-rf ask for twice the samples
+    // the radio can produce in a slot, so each read overruns the slot, and it points the
+    // demodulator at a stream twice as fast as the real one.
+    //
+    // The device type and the dual-tuner setting have to be in place before asking, and neither
+    // of those setters touches hardware - they are read again in the acquisition loop, which is
+    // what actually opens the radio.
+    SDR.setType(DeviceType);
+    SDR.setRspDuoDualTuner(DualTuner);
+    SDR.setRspDuoSelectionDiversity(SelectionDiversity);
+    SampleRate=(int)SDR.predictSampleRate((uint32_t)AdcRate);
+    if(SampleRate!=(int)AdcRate)
+      printf("RF.SampleRate %d Hz requested, the device delivers %d Hz to the host\n",
+             AdcRate, SampleRate);
 
     double InpGain= 60.0; config_lookup_float_or_int(Config, "RF.OGN.Gain",         &InpGain); OGN_Gain=(int)floor(InpGain*10+0.5);
            InpGain= 20.0; config_lookup_float_or_int(Config, "RF.GSM.Gain",         &InpGain); GSM_Gain=(int)floor(InpGain*10+0.5);
@@ -276,11 +297,26 @@ class RF_Acq                                    // acquire wideband (1MHz) RF da
          int SamplesToRead=OGN_SamplesPerRead;
          int LifeSlots=2;
          if( ReadGSM || (QueueSize()>1) ) { SamplesToRead/=2; LifeSlots=1; }  // when GSM calibration or data is not being processed fast enough we only read half-time
+#ifdef ACQ_TRACE
+         // One line per iteration: what the loop decided and why. The aggregate Live Time
+         // counter alone cannot tell a short read from a skipped slot, a retune or a stalled
+         // demodulator, and those have entirely different fixes.
+         if(WaitTime>=0.200)
+           printf("ACQ skip  t=%10.3f frac=%.3f wait=%.3f q=%d\n", Now, FracTimeNow, WaitTime, QueueSize());
+#endif
          if(WaitTime<0.200)
          { usleep((int)floor(1e6*WaitTime+0.5));                              // wait right before the time slot starts
            SampleBuffer<uint8_t> *Buffer = OutQueue.New();                    // get the next buffer to fill with raw I/Q data
            SDR.ResetBuffer();                                                 // needed before every Read()
+#ifdef ACQ_TRACE
+           double TraceT0=SDR.getTime();
+#endif
            int Read=SDR.Read(*Buffer, SamplesToRead);                         // read the time slot raw RF data
+#ifdef ACQ_TRACE
+           printf("ACQ read  t=%10.3f frac=%.3f wait=%.3f want=%d got=%d dt=%.3f q=%d ba=%llu bb=%llu\n",
+                  SDR.getTime(), FracTimeNow, WaitTime, SamplesToRead, Read, SDR.getTime()-TraceT0, QueueSize(),
+                  (unsigned long long)SDR.getRspDuoBytesRead(0), (unsigned long long)SDR.getRspDuoBytesRead(1));
+#endif
            if(Read>0) // RF data Read() successful
            { Buffer->Freq += Buffer->Freq * (1e-6*GSM_FreqCorr);                 // correct the frequency (sign ?)
              if(OGN_SaveRawData>0)
@@ -344,7 +380,15 @@ Content-Disposition: attachment; filename=\"%s_%07.3fMHz_%03.1fMsps_%10dsec.jpg\
              }
            }
            // if(ReadGSM | OGN_FreqHopChannels)
+#ifdef ACQ_TRACE
+           { double TuneT0=SDR.getTime();
+             int Changed=(NextCenterFreq!=CurrCenterFreq);
+             SDR.setCenterFreq(NextCenterFreq); CurrCenterFreq=NextCenterFreq;
+             printf("ACQ tune  t=%10.3f dt=%.3f freq=%.3fMHz changed=%d\n",
+                    SDR.getTime(), SDR.getTime()-TuneT0, 1e-6*NextCenterFreq, Changed); }
+#else
            { SDR.setCenterFreq(NextCenterFreq); CurrCenterFreq=NextCenterFreq; }
+#endif
          }
          else usleep(100000);
        }
@@ -360,7 +404,7 @@ Content-Disposition: attachment; filename=\"%s_%07.3fMHz_%03.1fMsps_%10dsec.jpg\
          if(DeviceSerial[0]) Index=SDR.getDeviceIndexBySerial(DeviceSerial);
          if(Index<0) Index=DeviceIndex;
          SDR.FreqRaster = FreqRaster;
-         if(SDR.Open(Index, CurrCenterFreq, SampleRate)<0)                    // try to open it
+         if(SDR.Open(Index, CurrCenterFreq, AdcRate)<0)                        // try to open it
          { printf("RF_Acq.Exec() ... SDR.Open(%d, , ) fails, retry after 1 sec\n", Index); usleep(1000000); }
          else
          { SDR.setOffsetTuning(OffsetTuning);
@@ -1034,7 +1078,12 @@ Refresh: 5\r\n\
      dprintf(Client->SocketFile, "<tr><td>RF.Device</td><td align=right><b>%d</b></td></tr>\n",                       RF->DeviceIndex);
      if(RF->DeviceSerial[0])
        dprintf(Client->SocketFile, "<tr><td>RF.DeviceSerial</td><td align=right><b>%s</b></td></tr>\n",               RF->DeviceSerial);
-     dprintf(Client->SocketFile, "<tr><td>RF.SampleRate</td><td align=right><b>%3.1f MHz</b></td></tr>\n",       1e-6*RF->SampleRate);
+     dprintf(Client->SocketFile, "<tr><td>RF.SampleRate</td><td align=right><b>%3.1f MHz</b></td></tr>\n",       1e-6*RF->AdcRate);
+     // Only worth a row when the radio does not deliver what it was asked for - the RSPduo in
+     // dual-tuner mode, where the API's fixed combination decides the rate. Everything ogn-rf
+     // sizes (slot length, demodulator FFT) uses this figure, not the requested one above.
+     if(RF->SampleRate!=RF->AdcRate)
+       dprintf(Client->SocketFile, "<tr><td>Delivered to host</td><td align=right><b>%3.3f MHz</b></td></tr>\n",    1e-6*RF->SampleRate);
      // dprintf(Client->SocketFile, "<tr><td>RF.PipeName</td><td align=right><b>%s</b></td></tr>\n",                  ??->OutPipeName );
      dprintf(Client->SocketFile, "<tr><td>RF.FreqCorr</td><td align=right><b>%+3d ppm</b></td></tr>\n",              RF->FreqCorr);
      if(RF->FreqRaster)

@@ -203,6 +203,19 @@ class SDR_Device
      if(Type==RSP_DUO)  return Rsp.getSampleRate();
      return RTL.getSampleRate(); }
 
+   // What the host will actually be fed for a requested rate, answered from the settings alone so
+   // it can be asked before Open(). For an RTL-SDR and a LimeSDR the host rate is the rate asked
+   // for; the RSPduo is the exception, because in dual-tuner mode the API fixes the delivered rate
+   // from its own (ADC rate, bandwidth, IF) combination instead. ogn-rf sizes its slot reads and
+   // its demodulator from one rate read at startup, so it has to ask here rather than assume.
+   uint32_t predictSampleRate(uint32_t Requested)
+   {
+#ifdef USE_RSPDUO
+     if(Type==RSP_DUO) return Rsp.predictSampleRate(Requested);
+#endif
+     (void)Requested;
+     return Requested; }
+
    // LimeSDR only: on-chip capture-and-decimate ratio. The RSPduo has decimation of its own but
    // it is driven from the sample rate, not from this knob, and an RTL-SDR has no equivalent.
    void setOversample(int Ratio)
